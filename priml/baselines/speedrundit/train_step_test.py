@@ -14,6 +14,7 @@ import torch
 from priml.baselines.speedrundit.experiments import exp_smoke
 from priml.baselines.speedrundit.model_test import tiny_model
 from priml.baselines.speedrundit.train_step import SpeedrunTrainStep
+from priml.model.vision_ae.latent_norm import ScaleLatents
 from priml.testing.bfb import assert_bfb_against_golden
 from priml.train.ema import NoEMA
 from priml.train.parallelism import NoParallel
@@ -55,6 +56,7 @@ def test_train_step_updates_model_and_advances_budget() -> None:
     config.dtype_autocast = None
     config.compile = None
     config.train_budget_steps = 2
+    config.latent_norm = ScaleLatents.Config(scale=0.3099)
     step = config.make()
     batch = step.preprocess_batch(
         {
@@ -74,7 +76,10 @@ class _SmokeSteps(nn.Module):
 
     def __init__(self) -> None:
         super().__init__()
-        config = exp_smoke().step
+        smoke = exp_smoke()
+        config = smoke.step
+        # What SpeedrunTrainLoop.finalize fills; the step is built without the loop.
+        config.latent_norm = smoke.dataset.source.autoencoder.default_latent_norm()
         config.model.input_size = 4
         config.model.in_channels = 2
         # Size only. Eight channels over two heads keeps a real head axis. Three

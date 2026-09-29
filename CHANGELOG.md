@@ -5,6 +5,42 @@ All notable priml changes are documented here. This project follows
 
 ## Unreleased
 
+### Added
+
+- `priml.model.vision_ae`: pretrained vision autoencoders behind one
+  `Autoencoder` protocol (`encode` uint8 images to raw latents, `decode`
+  back to `[0, 1]` pixels). `VariationalAutoencoder` adds `posterior`; the
+  latent a variational `encode` returns is the config's `latent` function
+  (`posterior_sample` or `posterior_mode`). Implementations: `INVAE`, `VTP`
+  (`vtp_small`, `vtp_base`, `vtp_large`), and `RAE` (`rae_dinov2_base`).
+  Checkpoints are config nodes (`HubFile`, `UrlFile`, `LocalFile`) pinned to
+  a revision and SHA-256; latent normalizers (`ScaleLatents`,
+  `ElementwiseLatentStats`, `ChannelLatentStats`) keep each reference's
+  operation order.
+- `priml.math.scalar_quantization`: exact Lloyd-Max fitting on sorted
+  samples, the cube-root high-resolution start, standard-normal levels, and
+  batched nearest-level `quantize` / `dequantize`.
+- SpeedrunDiT: storage codecs (`FloatCodec`, `ScalarTableCodec` with injected
+  table fits and channel grouping), a corpus receipt checked at load time,
+  `prepare_data.py --experiment`, `benchmark_codec.py`, and experiments
+  exp002 (VTP), exp003 (RAE, float16 storage), and exp004 (RAE, uint8
+  storage).
+
+### Changed
+
+- `priml.model.invae` moved to `priml.model.vision_ae.invae`. `AutoencoderKL`,
+  `VAE_F16D32`, `VAE_F8D4`, `vae_models`, `encode_image`, `decode_latents`,
+  and `load_invae` are removed; build `INVAE.Config().make()` and call
+  `encode` / `decode`. The architecture and the published checkpoint's keys
+  are unchanged.
+- SpeedrunDiT: `SpeedrunTrainStep.Config.latent_scale` is replaced by the
+  `latent_norm` slot, filled at loop finalize from the dataset's autoencoder
+  (INVAE's is the same `* 0.3099`). `PairedImageLatentDataset.Config` gains
+  `latent_subdir`, `autoencoder`, `codec`, and `seed`, and requires a
+  `corpus.json` receipt; record one for an existing REG corpus with
+  `prepare_data.py --receipt-only`. `prepare_data.py` takes `--experiment`
+  in place of `--output`, `--checkpoint`, and `--resolution`.
+
 ## 0.1.4 - 2026-08-19
 
 ### Changed
