@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+from dataclasses import field
 from pathlib import Path
-from typing import TYPE_CHECKING, Final, cast, override
+from typing import Final, cast, override
 
 from configgle import Fig, Makeable
 from PIL import Image
@@ -17,11 +18,8 @@ from priml.baselines.speedrundit.data import PairedImageLatentDataset
 from priml.baselines.speedrundit.latent_codec import ScalarTableCodec
 from priml.baselines.speedrundit.scripts import prepare_data
 from priml.lib.custom_json import DictCodec, loads
+from priml.model.vision_ae.custom_types import LatentNormalizer
 from priml.model.vision_ae.latent_norm import ScaleLatents
-
-
-if TYPE_CHECKING:
-    from priml.model.vision_ae.custom_types import LatentNormalizer
 
 
 _CWD: Final = Path(__file__).resolve().parent
@@ -36,13 +34,14 @@ class _MeanAutoencoder(nn.Module):
         image_size: int = _SIZE
         """Crop side."""
 
+        latent_norm: Makeable[LatentNormalizer] = field(
+            default_factory=ScaleLatents.Config,
+        )
+        """The identity scale."""
+
         def latent_shape(self) -> tuple[int, int, int]:
             """Return four channels on a 1x1 grid."""
             return 4, 1, 1
-
-        def default_latent_norm(self) -> Makeable[LatentNormalizer]:
-            """Return the identity scale."""
-            return ScaleLatents.Config()
 
     def __init__(self, config: Config) -> None:
         super().__init__()

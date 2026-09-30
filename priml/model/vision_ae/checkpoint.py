@@ -3,28 +3,24 @@
 A checkpoint is a node in the config tree, not a path string, so a run's
 weights print, diff, and land in a corpus receipt. Every published default pins
 a revision AND a SHA-256: the revision says which upload, the digest says the
-bytes did not change underneath it. Resolution happens at ``make()`` time, never
-in ``finalize``, so building a config never touches the network.
+bytes did not change underneath it. Only ``path()`` resolves -- never
+``finalize`` or ``make()`` -- so building a config never touches the network.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING
 
 import hashlib
-import shutil
-import tempfile
-import urllib.request
 
 from configgle import Fig
 
+from priml.data.ensure import DataSpec, FileSpec, ensure_data, resumable_http_download
 from priml.hub import get_cache_dir
 
 
 if TYPE_CHECKING:
-    from http.client import HTTPResponse
-
     import huggingface_hub
 else:
     from wrapt import lazy_import
@@ -115,24 +111,20 @@ class UrlFile:
         Returns:
           path: Local file.
 
+        Raises:
+          RuntimeError: The downloaded bytes do not hash to ``sha256``.
+
         """
         name = self.config.url.rsplit("/", 1)[-1]
-        path = get_cache_dir() / "url" / self.config.sha256 / name
-        if not path.is_file():
-            path.parent.mkdir(parents=True, exist_ok=True)
-            # Staged beside the target, then renamed: an interrupted download
-            # must not leave a truncated file the existence check would accept.
-            with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as staging:
-                response = cast(
-                    "HTTPResponse",
-                    urllib.request.urlopen(self.config.url),  # noqa: S310 -- The config requires an https URL.
-                )
-                with response:
-                    shutil.copyfileobj(response, staging)
-            verify_sha256(Path(staging.name), self.config.sha256)
-            Path(staging.name).replace(path)
-        verify_sha256(path, self.config.sha256)
-        return path
+        target = get_cache_dir() / "url" / self.config.sha256
+        _ = ensure_data(
+            DataSpec(
+                target_dir=target,
+                manifest=[FileSpec(rel_path=name, sha256=self.config.sha256)],
+                fetch=self._fetch,
+            ),
+        )
+        return target / name
 
     def identity(self) -> dict[str, str]:
         """Return the URL and digest.
@@ -142,6 +134,11 @@ class UrlFile:
 
         """
         return {"url": self.config.url, "sha256": self.config.sha256}
+
+    def _fetch(self, *, rel_path: str, dest: Path) -> None:
+        """Download the configured URL to ``dest``; ``rel_path`` is its name."""
+        del rel_path
+        resumable_http_download(url=self.config.url, dest=dest)
 
 
 class LocalFile:

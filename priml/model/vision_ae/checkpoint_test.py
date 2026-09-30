@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 import hashlib
+import io
 
 import pytest
 
@@ -15,6 +16,8 @@ from priml.model.vision_ae.custom_types import CheckpointFile
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+    import urllib.request
 
 
 def _file(tmp_path: Path, payload: bytes = b"weights") -> tuple[Path, str]:
@@ -106,6 +109,37 @@ def test_url_file_reuses_a_cached_copy_keyed_by_digest(
     monkeypatch.setattr("urllib.request.urlopen", refuse)
     source = UrlFile.Config(url="https://example.com/x/stats.pt", sha256=digest)
     assert source.make().path() == cached
+
+
+def test_url_file_downloads_once_and_refuses_the_wrong_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TORCH_HOME", str(tmp_path / "cache"))
+    payload = b"statistics"
+    digest = hashlib.sha256(payload).hexdigest()
+    urls: list[str] = []
+
+    def serve(request: urllib.request.Request) -> _Response:
+        urls.append(request.full_url)
+        return _Response(payload)
+
+    monkeypatch.setattr("urllib.request.urlopen", serve)
+    source = UrlFile.Config(url="https://example.com/x/stats.pt", sha256=digest)
+    path = source.make().path()
+    assert path.read_bytes() == payload
+    assert source.make().path() == path
+    assert urls == ["https://example.com/x/stats.pt"]
+    wrong = UrlFile.Config(url="https://example.com/y/stats.pt", sha256="0" * 64)
+    with pytest.raises(RuntimeError, match="unsatisfied"):
+        _ = wrong.make().path()
+
+
+class _Response(io.BytesIO):
+    """The part of ``HTTPResponse`` a whole, unranged download reads."""
+
+    status = 200
+    headers: ClassVar[dict[str, str]] = {}
 
 
 def test_sha256_file_matches_hashlib(tmp_path: Path) -> None:

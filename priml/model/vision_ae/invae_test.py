@@ -37,7 +37,7 @@ def tiny() -> INVAE.Config:
     config.channels_hidden = 2
     config.channel_multipliers = (1, 2)
     config.channels_latent = 2
-    config.num_res_blocks = 1
+    config.blocks_per_stage = 1
     config.num_groups = 2
     config.image_size = 16
     config.checkpoint = None
@@ -93,7 +93,7 @@ def test_decode_returns_the_image_shape_in_the_unit_interval() -> None:
 
 def test_mode_latent_is_the_posterior_mean() -> None:
     config = tiny()
-    config.latent = posterior_mode
+    config.latent_fn = posterior_mode
     model = config.make()
     assert torch.equal(model.encode(_image()), model.posterior(_image()).mean)
 
@@ -136,8 +136,8 @@ def test_published_latent_is_32_channels_at_16x16() -> None:
     assert INVAE.Config().latent_shape() == (32, 16, 16)
 
 
-def test_default_latent_norm_is_the_published_scale() -> None:
-    norm = INVAE.Config().default_latent_norm()
+def test_latent_norm_is_the_published_scale() -> None:
+    norm = INVAE.Config().latent_norm
     assert isinstance(norm, ScaleLatents.Config)
     assert norm.scale == 0.3099
 

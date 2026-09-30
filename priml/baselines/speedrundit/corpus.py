@@ -230,7 +230,7 @@ def write_receipt(
             "config": pformat(codec_config, hide_default_values=False),
         },
         "suggested_latent_norm": pformat(
-            autoencoder.default_latent_norm(),
+            autoencoder.latent_norm,
             hide_default_values=False,
         ),
         "details": dict(details),

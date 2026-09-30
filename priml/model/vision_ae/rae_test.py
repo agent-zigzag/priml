@@ -55,7 +55,7 @@ def tiny() -> RAE.Config:
     assert isinstance(encoder, Dinov2WithRegisters.Config)
     encoder.channels_hidden = 8
     encoder.num_layers = 1
-    encoder.num_heads = 2
+    encoder.heads = 2
     encoder.patch_size = 4
     encoder.image_size = 12
     encoder.checkpoint = None
@@ -63,8 +63,9 @@ def tiny() -> RAE.Config:
     config.decoder.channels_hidden = 8
     config.decoder.channels_hidden_mlp = 16
     config.decoder.num_layers = 1
-    config.decoder.num_heads = 2
+    config.decoder.heads = 2
     config.decoder.patch_size = 4
+    config.decoder.checkpoint = None
     config.image_size = 8
     return config
 
@@ -163,11 +164,12 @@ def test_rejects_an_encoder_side_the_patch_does_not_divide() -> None:
         _ = config.copy_tree().finalize()
 
 
-def test_rejects_a_decoder_width_the_encoder_does_not_produce() -> None:
+def test_decoder_takes_its_width_and_token_count_from_the_encoder() -> None:
     config = tiny()
     config.decoder.channels_in = 16
-    with pytest.raises(ValueError, match=r"decoder\.channels_in is 16"):
-        _ = config.copy_tree().finalize()
+    finalized = config.copy_tree().finalize()
+    assert finalized.decoder.channels_in == 8
+    assert finalized.decoder.num_patches == 4
 
 
 def test_encoder_cost_matches_torch() -> None:
@@ -352,8 +354,8 @@ def test_published_latent_is_768_channels_at_16x16() -> None:
     assert rae_dinov2_base().latent_shape() == (768, 16, 16)
 
 
-def test_default_latent_norm_is_the_published_imagenet_stats() -> None:
-    norm = rae_dinov2_base().default_latent_norm()
+def test_latent_norm_is_the_published_imagenet_stats() -> None:
+    norm = rae_dinov2_base().latent_norm
     assert isinstance(norm, ElementwiseLatentStats.Config)
     assert norm.eps == 1e-5
     assert isinstance(norm.stats, HubFile.Config)

@@ -44,6 +44,8 @@ from priml.cost import (
     resolve_dtype,
     traffic,
 )
+from priml.math.basic import ceil_multiple
+from priml.math.pixel import rgb2float
 from priml.model import norm as priml_norm
 from priml.model.attention.kernel import attention_kernel_cost
 from priml.model.conv import conv_cost
@@ -76,7 +78,12 @@ def rope_apply(x: Tensor, sin: Tensor, cos: Tensor) -> Tensor:
 
 
 class RMSNorm(nn.Module):
-    """The reference's RMSNorm: normalize in float32, cast back, then scale."""
+    """The reference's RMSNorm: normalize in float32, cast back, then scale.
+
+    Not :class:`priml.model.norm.RMSNorm`: the two agree bit for bit in float32,
+    but on bfloat16 activations -- the encoder under ``dtype_autocast`` -- this
+    one promotes to the float32 weight and returns different bits.
+    """
 
     def __init__(self, dim: int, eps: float = 1e-5) -> None:
         super().__init__()
@@ -660,7 +667,7 @@ class VTP(nn.Module):
     """
 
     class Config(Fig["VTP"]):
-        """Trunk and decoder sizes, pixel statistics, precision, and weights."""
+        """Trunk and decoder sizes, pixel statistics, precision, weights, and latent norm."""
 
         trunk: DinoVisionTransformerWithBottleneck.Config = field(
             default_factory=DinoVisionTransformerWithBottleneck.Config,
@@ -699,13 +706,18 @@ class VTP(nn.Module):
         )
         """Published weights; ``None`` keeps the random initialization."""
 
-        latent_stats: Makeable[CheckpointFile] = field(
-            default_factory=lambda: UrlFile.Config(
-                url=f"{_LATENT_STATS_ROOT}/vtp_l/latents_stats.pt",
-                sha256="0ad1fadbfb8959f3a93147a4db668b6d704ae36ff320bfad53cd3d568de7b0fd",
+        latent_norm: Makeable[LatentNormalizer] = field(
+            default_factory=lambda: ChannelLatentStats.Config(
+                stats=UrlFile.Config(
+                    url=f"{_LATENT_STATS_ROOT}/vtp_l/latents_stats.pt",
+                    sha256="0ad1fadbfb8959f3a93147a4db668b6d704ae36ff320bfad53cd3d568de7b0fd",
+                ),
             ),
         )
-        """Per-channel latent mean and std published with ``checkpoint``."""
+        """Per-channel standardization by the statistics published with ``checkpoint``.
+
+        The autoencoder itself never applies it.
+        """
 
         @override
         def finalize(self) -> Self:
@@ -727,10 +739,6 @@ class VTP(nn.Module):
             """Return ``(trunk.channels_out, side, side)`` at ``image_size``."""
             side = self.image_size // self.trunk.patch_size
             return self.trunk.channels_out, side, side
-
-        def default_latent_norm(self) -> Makeable[LatentNormalizer]:
-            """Return per-channel standardization by ``latent_stats``, multiplier 1."""
-            return ChannelLatentStats.Config(stats=self.latent_stats)
 
         def cost(
             self,
@@ -862,7 +870,8 @@ class VTP(nn.Module):
                 f"patch_size {self.patch_size}.",
             )
         # Divide then normalize, as torchvision's ToTensor then Normalize do.
-        pixels = (image.float() / 255 - self.pixel_mean) / self.pixel_std
+        unit = rgb2float(image, float_dtype=torch.float32, unit_interval=True)
+        pixels = (unit - self.pixel_mean) / self.pixel_std
         autocast = (
             nullcontext()
             if self.dtype_autocast is None
@@ -900,9 +909,11 @@ def vtp_small() -> VTP.Config:
         revision="378967941e66f7f09a9e10218aa8710a930cc635",
         sha256="5442083e078aadc65e51c7893d10177e360139866d4e09ab955b1c7b563eeaee",
     )
-    config.latent_stats = UrlFile.Config(
-        url=f"{_LATENT_STATS_ROOT}/vtp_s/latents_stats.pt",
-        sha256="9f4bb851a6226843c0bdb9b25330faa2a8428e5c10a77f79a974f145cf848eff",
+    config.latent_norm = ChannelLatentStats.Config(
+        stats=UrlFile.Config(
+            url=f"{_LATENT_STATS_ROOT}/vtp_s/latents_stats.pt",
+            sha256="9f4bb851a6226843c0bdb9b25330faa2a8428e5c10a77f79a974f145cf848eff",
+        ),
     )
     return config
 
@@ -922,9 +933,11 @@ def vtp_base() -> VTP.Config:
         revision="21fe3a9cb53f01a2c7f3b622efdc8d2534a7c79d",
         sha256="c7fdbb1507cecbcbb35eab4ea9fcbca8dc80b5e0d64cfe0c37b7baacdbb0fa05",
     )
-    config.latent_stats = UrlFile.Config(
-        url=f"{_LATENT_STATS_ROOT}/vtp_b/latents_stats.pt",
-        sha256="f7c030310f3eeaa38d2d0838f38eeab1d9922fcaf183a0fe8dd1f1287366c4a7",
+    config.latent_norm = ChannelLatentStats.Config(
+        stats=UrlFile.Config(
+            url=f"{_LATENT_STATS_ROOT}/vtp_b/latents_stats.pt",
+            sha256="f7c030310f3eeaa38d2d0838f38eeab1d9922fcaf183a0fe8dd1f1287366c4a7",
+        ),
     )
     return config
 
@@ -976,8 +989,7 @@ def _autoencoder_state(checkpoint: Mapping[str, Tensor]) -> dict[str, Tensor]:
 
 def _swiglu_channels_hidden(hidden_features: int) -> int:
     """Return SwiGLU's hidden width: ``2/3`` of nominal, aligned up to 8."""
-    d = int(hidden_features * 2 / 3)
-    return d + (-d % 8)
+    return ceil_multiple(int(hidden_features * 2 / 3), 8)
 
 
 def _transformer_cost(

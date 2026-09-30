@@ -1,17 +1,17 @@
 """Latent normalizers: raw autoencoder latents to the space a diffusion model sees.
 
 One class per published convention, each in its reference's exact operation
-order. They are NOT folded into one affine map: ``sqrt(var + eps)`` is not the
-stored ``std``, and multiplying by a reciprocal is not dividing, so a merged
-form would move the last bits every golden pins.
+order. They are NOT folded into one precomputed scale and shift: multiplying by
+a reciprocal rounds differently from the references' divides, so a merged form
+would move the last bits every golden pins.
 
 A normalizer is separate from the autoencoder (which never applies it) and from
 a storage codec (which never sees it): a corpus stores raw latents, so changing
 normalization never requires re-encoding.
 
 Normalizers are plain objects, not modules: they hold no parameters and run on
-data rather than in a model slot. Statistics follow the latent to its device on
-first use, as the reference moves them per call, and are cached there.
+data rather than in a model slot. Statistics stay on the CPU and move to the
+latent's device per call, as the RAE reference moves them.
 """
 
 from __future__ import annotations
@@ -65,35 +65,14 @@ class ScaleLatents:
         return latent / self.scale
 
 
-# A base class, so it precedes the two normalizers that share it.
-class _DeviceStats:
-    """Statistics kept on the CPU and copied, once per device, to where latents are."""
-
-    def __init__(self, stats: dict[str, Tensor | None]) -> None:
-        self._stats: dict[torch.device, dict[str, Tensor | None]] = {
-            torch.device("cpu"): stats,
-        }
-
-    def _on(self, latent: Tensor) -> dict[str, Tensor | None]:
-        """Return the statistics on ``latent``'s device."""
-        device = latent.device
-        if device not in self._stats:
-            source = self._stats[torch.device("cpu")]
-            self._stats[device] = {
-                name: None if value is None else value.to(device)
-                for name, value in source.items()
-            }
-        return self._stats[device]
-
-
-class ElementwiseLatentStats(_DeviceStats):
+class ElementwiseLatentStats:
     """Standardize each ``[C, H, W]`` element: ``(z - mean) / sqrt(var + eps)``.
 
     RAE's convention, with statistics estimated over the training images and
-    stored as ``{"mean": Tensor | None, "var": Tensor | None}``; a ``None``
-    member is skipped, as the reference skips it, rather than replaced by 0 or 1
-    -- subtracting a zero tensor is exact, but dividing by ``sqrt(1 + eps)`` is
-    not the identity.
+    stored as ``{"mean": Tensor | None, "var": Tensor}``. A missing mean is
+    skipped, which is bit-identical to the reference's subtracting 0. A missing
+    var is refused: the reference's ``else 1`` reaches ``torch.sqrt`` as a
+    float, which raises.
 
     References:
       https://github.com/bytetriper/RAE/blob/a4d18c4db766419cbe7cb8c02cd9f7ceb0ec9041/src/stage1/rae.py
@@ -104,7 +83,7 @@ class ElementwiseLatentStats(_DeviceStats):
         """Where the statistics live."""
 
         stats: Makeable[CheckpointFile] | None = None
-        """File holding ``mean`` and ``var``."""
+        """File holding ``var`` and, optionally, ``mean``."""
 
         eps: float = 1e-5
         """Added to the variance before the square root."""
@@ -118,7 +97,11 @@ class ElementwiseLatentStats(_DeviceStats):
                 config.stats.make().path(), map_location="cpu", weights_only=True
             ),
         )
-        super().__init__({"mean": payload.get("mean"), "var": payload.get("var")})
+        var = payload.get("var")
+        if var is None:
+            raise ValueError("ElementwiseLatentStats needs a var in its stats file.")
+        self.mean = payload.get("mean")
+        self.var = var
         self.eps = config.eps
 
     def normalize(self, latent: Tensor, /) -> Tensor:
@@ -131,13 +114,9 @@ class ElementwiseLatentStats(_DeviceStats):
           normalized: Standardized latent.
 
         """
-        stats = self._on(latent)
-        mean, var = stats["mean"], stats["var"]
-        if mean is not None:
-            latent = latent - mean
-        if var is not None:
-            latent = latent / torch.sqrt(var + self.eps)
-        return latent
+        if self.mean is not None:
+            latent = latent - self.mean.to(latent.device)
+        return latent / torch.sqrt(self.var.to(latent.device) + self.eps)
 
     def denormalize(self, latent: Tensor, /) -> Tensor:
         """Return ``latent * sqrt(var + eps) + mean``.
@@ -149,16 +128,13 @@ class ElementwiseLatentStats(_DeviceStats):
           raw: Raw latent.
 
         """
-        stats = self._on(latent)
-        mean, var = stats["mean"], stats["var"]
-        if var is not None:
-            latent = latent * torch.sqrt(var + self.eps)
-        if mean is not None:
-            latent = latent + mean
+        latent = latent * torch.sqrt(self.var.to(latent.device) + self.eps)
+        if self.mean is not None:
+            latent = latent + self.mean.to(latent.device)
         return latent
 
 
-class ChannelLatentStats(_DeviceStats):
+class ChannelLatentStats:
     """Standardize per channel, then scale: ``(z - mean) / std * multiplier``.
 
     VTP's convention, applied by its LightningDiT training data and inverted as
@@ -188,7 +164,8 @@ class ChannelLatentStats(_DeviceStats):
                 config.stats.make().path(), map_location="cpu", weights_only=True
             ),
         )
-        super().__init__({"mean": payload["mean"], "std": payload["std"]})
+        self.mean = payload["mean"]
+        self.std = payload["std"]
         self.multiplier = config.multiplier
 
     def normalize(self, latent: Tensor, /) -> Tensor:
@@ -201,7 +178,7 @@ class ChannelLatentStats(_DeviceStats):
           normalized: Standardized, scaled latent.
 
         """
-        mean, std = self._stats_on(latent)
+        mean, std = self.mean.to(latent.device), self.std.to(latent.device)
         return (latent - mean) / std * self.multiplier
 
     def denormalize(self, latent: Tensor, /) -> Tensor:
@@ -214,13 +191,5 @@ class ChannelLatentStats(_DeviceStats):
           raw: Raw latent.
 
         """
-        mean, std = self._stats_on(latent)
+        mean, std = self.mean.to(latent.device), self.std.to(latent.device)
         return (latent * std) / self.multiplier + mean
-
-    def _stats_on(self, latent: Tensor) -> tuple[Tensor, Tensor]:
-        """Return the mean and std on ``latent``'s device; both are always stored."""
-        stats = self._on(latent)
-        mean, std = stats["mean"], stats["std"]
-        assert mean is not None
-        assert std is not None
-        return mean, std

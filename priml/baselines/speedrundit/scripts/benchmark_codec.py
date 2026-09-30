@@ -269,7 +269,7 @@ def run(
         )
         for chosen_records in (fit_records, eval_records)
     )
-    normalizer = config.autoencoder.default_latent_norm().make()
+    normalizer = config.autoencoder.latent_norm.make()
     decode = None
     perceptual = None
     if decode_images:

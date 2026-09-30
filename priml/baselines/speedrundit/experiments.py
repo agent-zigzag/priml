@@ -55,7 +55,7 @@ class SpeedrunTrainLoop(
         # an overwrite, since the model's widths are the experiment's own choice.
         autoencoder = self.dataset.source.autoencoder
         if self.step.latent_norm is None:
-            self.step.latent_norm = autoencoder.default_latent_norm()
+            self.step.latent_norm = autoencoder.latent_norm
         channels, height, width = autoencoder.latent_shape()
         model = self.step.model
         if (model.in_channels, model.input_size, model.input_size) != (

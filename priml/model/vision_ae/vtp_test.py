@@ -284,11 +284,9 @@ def test_published_latent_is_64_channels_at_16x16() -> None:
     assert vtp_large().latent_shape() == (64, 16, 16)
 
 
-def test_default_latent_norm_standardizes_by_the_published_stats() -> None:
-    config = vtp_large()
-    norm = config.default_latent_norm()
+def test_latent_norm_standardizes_by_the_published_stats() -> None:
+    norm = vtp_large().latent_norm
     assert isinstance(norm, ChannelLatentStats.Config)
-    assert norm.stats is config.latent_stats
     assert norm.multiplier == 1.0
     assert isinstance(norm.stats, UrlFile.Config)
     assert norm.stats.url.endswith(
@@ -388,7 +386,7 @@ def test_published_large_checkpoint_round_trips() -> None:
     """Download VTP-Large, load it strictly, and reconstruct a flat gray image."""
     config = vtp_large()
     model = config.make()
-    norm = config.default_latent_norm().make()
+    norm = config.latent_norm.make()
     image = torch.full((1, 3, 32, 32), 128, dtype=torch.uint8)
     latent = model.encode(image)
     assert latent.shape == (1, 64, 2, 2)

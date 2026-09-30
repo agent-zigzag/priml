@@ -539,8 +539,8 @@ class DiagonalGaussianDistribution:
 class INVAE(nn.Module):
     """INVAE behind the ``VariationalAutoencoder`` contract.
 
-    ``encode`` returns whatever latent the config's ``latent`` function takes
-    from the posterior -- a draw by default, which is what the REG corpora
+    ``encode`` returns whatever latent the config's ``latent_fn`` takes from
+    the posterior -- a draw by default, which is what the REG corpora
     store -- and ``posterior`` exposes the distribution itself. Frozen: the
     wrapper stays in evaluation mode whatever its parent does.
     """
@@ -549,16 +549,16 @@ class INVAE(nn.Module):
         """Architecture size, latent choice, and checkpoint."""
 
         channels_hidden: int = 128
-        """Width of the first resolution level."""
+        """Stem width; stage ``i`` is ``channels_hidden * channel_multipliers[i]`` wide."""
 
         channel_multipliers: tuple[int, ...] = (1, 1, 2, 2, 4)
-        """Width multiplier per resolution level; each level after the first halves the grid."""
+        """Width multiplier per stage; each stage after the first halves the grid."""
 
         channels_latent: int = 32
         """Latent channels."""
 
-        num_res_blocks: int = 2
-        """Residual blocks per resolution level in the encoder."""
+        blocks_per_stage: int = 2
+        """Residual blocks per encoder stage; the decoder runs one more."""
 
         num_groups: int = 32
         """GroupNorm groups; must divide every level's width."""
@@ -566,7 +566,7 @@ class INVAE(nn.Module):
         image_size: int = 256
         """Side of the square training image; attention runs where the grid is 16."""
 
-        latent: LatentFn = posterior_sample
+        latent_fn: LatentFn = posterior_sample
         """Takes ``encode``'s latent from the posterior: a draw, or its mode."""
 
         checkpoint: Makeable[CheckpointFile] | None = field(
@@ -578,6 +578,11 @@ class INVAE(nn.Module):
             ),
         )
         """Published weights; ``None`` keeps the random initialization."""
+
+        latent_norm: Makeable[LatentNormalizer] = field(
+            default_factory=lambda: ScaleLatents.Config(scale=0.3099),
+        )
+        """The published scale; the autoencoder itself never applies it."""
 
         @override
         def finalize(self) -> Self:
@@ -593,10 +598,6 @@ class INVAE(nn.Module):
             side = self.image_size // (1 << (len(self.channel_multipliers) - 1))
             return self.channels_latent, side, side
 
-        def default_latent_norm(self) -> Makeable[LatentNormalizer]:
-            """Return the published ``0.3099`` scale."""
-            return ScaleLatents.Config(scale=0.3099)
-
         def cost(
             self,
             *,
@@ -608,7 +609,7 @@ class INVAE(nn.Module):
 
             Counts the uint8 cast and rescale, the encoder, ``quant_conv``, the
             posterior's clamp and exponentials, one ``mean + std * noise`` draw
-            whatever ``latent`` selects, ``post_quant_conv``, the decoder, and
+            whatever ``latent_fn`` selects, ``post_quant_conv``, the decoder, and
             the output shift and clamp. The weights are frozen, so only the
             forward is charged; the parameters are still owned.
 
@@ -634,7 +635,7 @@ class INVAE(nn.Module):
             ch, mult, blocks = (
                 self.channels_hidden,
                 self.channel_multipliers,
-                self.num_res_blocks,
+                self.blocks_per_stage,
             )
             z = self.channels_latent
             side = self.image_size
@@ -701,7 +702,7 @@ class INVAE(nn.Module):
         architecture = {
             "ch": config.channels_hidden,
             "ch_mult": config.channel_multipliers,
-            "num_res_blocks": config.num_res_blocks,
+            "num_res_blocks": config.blocks_per_stage,
             "resolution": config.image_size,
             "z_channels": config.channels_latent,
             "num_groups": config.num_groups,
@@ -720,7 +721,7 @@ class INVAE(nn.Module):
             config.channels_latent,
             1,
         )
-        self.latent_fn = config.latent
+        self.latent_fn = config.latent_fn
         if config.checkpoint is not None:
             state = cast(
                 dict[str, Tensor],
@@ -750,8 +751,9 @@ class INVAE(nn.Module):
           posterior: Gaussian over ``[B, channels_latent, h, w]`` latents.
 
         """
-        # Divide then subtract, as the reference does: ``x / 255 * 2 - 1`` rounds
-        # differently, and existing corpora were encoded this way.
+        # Not ``rgb2float``: its ``(x - 127.5) / 127.5`` rounds 128 of the 256
+        # levels differently from the reference's ``x / 127.5 - 1``, which the
+        # published weights and existing corpora saw.
         moments = self.quant_conv(self.encoder(image.float() / 127.5 - 1))
         return DiagonalGaussianDistribution(moments)
 

@@ -12,7 +12,7 @@ Deviations from the reference, each deliberate:
 - ``encode`` takes uint8 and divides by 255 first, which is what the
   reference's ``ToTensor`` callers feed it.
 - No latent normalization: the autoencoder returns RAW latents, and the
-  published statistics are :meth:`RAE.Config.default_latent_norm`.
+  published statistics are ``RAE.Config.latent_norm``.
 - No ``noise_tau`` noising: it is a decoder-training augmentation, inert at
   the published inference setting (``noise_tau: 0``).
 - ``decode`` clamps to ``[0, 1]``, as the ``Autoencoder`` protocol requires;
@@ -57,9 +57,11 @@ from priml.cost import (
     traffic,
 )
 from priml.math.custom_types import TensorFn
+from priml.math.pixel import rgb2float
 from priml.math.position_embedding import sincos_position_table
 from priml.model.attention.kernel import attention_kernel_cost
 from priml.model.conv import conv_cost
+from priml.model.custom_types import ChannelsIn, propagate_attr
 from priml.model.norm import LayerNorm
 from priml.model.vision_ae.checkpoint import HubFile
 from priml.model.vision_ae.custom_types import CheckpointFile, LatentNormalizer
@@ -95,10 +97,10 @@ class PatchEncoderConfig(Makeable[PatchEncoder], Protocol):
     patch_size: int
     """Pixels per patch side."""
 
-    image_mean: tuple[float, float, float]
+    pixel_mean: tuple[float, float, float]
     """Per-channel mean subtracted from ``[0, 1]`` pixels."""
 
-    image_std: tuple[float, float, float]
+    pixel_std: tuple[float, float, float]
     """Per-channel deviation the centered pixels are divided by."""
 
 
@@ -118,11 +120,11 @@ class Dinov2WithRegisters(nn.Module):
         num_layers: int = 12
         """Transformer blocks (HF ``num_hidden_layers``)."""
 
-        num_heads: int = 12
+        heads: int = 12
         """Attention heads (HF ``num_attention_heads``)."""
 
-        mlp_ratio: int = 4
-        """MLP width as a multiple of ``channels_hidden``."""
+        expansion: int = 4
+        """MLP width over ``channels_hidden`` (HF ``mlp_ratio``, which HF types as an integer)."""
 
         patch_size: int = 14
         """Pixels per patch side."""
@@ -140,7 +142,7 @@ class Dinov2WithRegisters(nn.Module):
         """Layer-norm epsilon (HF ``layer_norm_eps``)."""
 
         hidden_act: str = "gelu"
-        """HF activation name; HF configs take names, not functions."""
+        """HF activation name; HF's config validates it as a string and refuses a function."""
 
         qkv_bias: bool = True
         """Whether the query, key, and value projections carry a bias."""
@@ -150,10 +152,9 @@ class Dinov2WithRegisters(nn.Module):
 
         The reference's ``from_pretrained`` resolves ``"sdpa"``, a fused
         kernel ``host_agnostic_numerics`` cannot reach inside; ``"eager"`` is
-        the plain matmul-softmax sequence, identical across transformers 4.56
-        and 5.x. They differ in rounding only: measured on the tiny parity
-        fixture under ``host_agnostic_numerics``, 6 of 64 latent values by at
-        most 3 float32 ULP.
+        the plain matmul-softmax sequence. They differ in rounding only:
+        measured on the tiny parity fixture under ``host_agnostic_numerics``,
+        6 of 64 latent values by at most 3 float32 ULP.
         """
 
         num_leading_tokens: int = 5
@@ -163,10 +164,10 @@ class Dinov2WithRegisters(nn.Module):
         ``num_register_tokens``.
         """
 
-        image_mean: tuple[float, float, float] = (0.485, 0.456, 0.406)
+        pixel_mean: tuple[float, float, float] = (0.485, 0.456, 0.406)
         """ImageNet mean, from the checkpoint's ``preprocessor_config.json``."""
 
-        image_std: tuple[float, float, float] = (0.229, 0.224, 0.225)
+        pixel_std: tuple[float, float, float] = (0.229, 0.224, 0.225)
         """ImageNet deviation, from the checkpoint's ``preprocessor_config.json``."""
 
         checkpoint: Makeable[CheckpointFile] | None = field(
@@ -226,11 +227,11 @@ class Dinov2WithRegisters(nn.Module):
             positions = table_grid * table_grid
             seq_len = 1 + self.num_register_tokens + patches
             rows = seq_len * batch_size
-            channels_mlp = channels * self.mlp_ratio
+            channels_mlp = channels * self.expansion
             layer = _vit_layer_cost(
                 channels=channels,
                 channels_mlp=channels_mlp,
-                num_heads=self.num_heads,
+                num_heads=self.heads,
                 seq_len=seq_len,
                 batch_size=batch_size,
                 qkv_bias=self.qkv_bias,
@@ -318,8 +319,8 @@ class Dinov2WithRegisters(nn.Module):
         hf_config = transformers.Dinov2WithRegistersConfig(
             hidden_size=config.channels_hidden,
             num_hidden_layers=config.num_layers,
-            num_attention_heads=config.num_heads,
-            mlp_ratio=config.mlp_ratio,
+            num_attention_heads=config.heads,
+            mlp_ratio=config.expansion,
             hidden_act=config.hidden_act,
             layer_norm_eps=config.eps,
             image_size=config.image_size,
@@ -525,7 +526,7 @@ class GeneralDecoder(nn.Module):
         num_layers: int = 28
         """Transformer blocks."""
 
-        num_heads: int = 16
+        heads: int = 16
         """Attention heads."""
 
         patch_size: int = 16
@@ -587,7 +588,7 @@ class GeneralDecoder(nn.Module):
             layer = _vit_layer_cost(
                 channels=channels,
                 channels_mlp=self.channels_hidden_mlp,
-                num_heads=self.num_heads,
+                num_heads=self.heads,
                 seq_len=seq_len,
                 batch_size=batch_size,
                 qkv_bias=True,
@@ -662,7 +663,7 @@ class GeneralDecoder(nn.Module):
             ViTMAELayer(
                 channels=config.channels_hidden,
                 channels_hidden=config.channels_hidden_mlp,
-                num_heads=config.num_heads,
+                num_heads=config.heads,
                 activation=config.activation,
                 eps=config.eps,
             )
@@ -736,7 +737,10 @@ class RAE(nn.Module):
     """
 
     class Config(Fig["RAE"]):
-        """Geometry, encoder, decoder, and the published latent normalizer."""
+        """Geometry, encoder, decoder, and the published latent normalizer.
+
+        The defaults are the published DINOv2-B (registers) model.
+        """
 
         image_size: int = 256
         """Side of the square image the decoder reconstructs."""
@@ -747,13 +751,29 @@ class RAE(nn.Module):
         encoder: PatchEncoderConfig = field(default_factory=Dinov2WithRegisters.Config)
         """Representation encoder; its tokens are the latent."""
 
-        decoder: GeneralDecoder.Config = field(default_factory=GeneralDecoder.Config)
-        """Pixel decoder, sized from the encoder's tokens."""
+        decoder: GeneralDecoder.Config = field(
+            default_factory=lambda: GeneralDecoder.Config(
+                checkpoint=HubFile.Config(
+                    repo_id="nyu-visionx/RAE-collections",
+                    filename="decoders/dinov2/wReg_base/ViTXL_n08/model.pt",
+                    revision="1be4f03273523431f099a934da4cf1940dc6039f",
+                    sha256="5fedf7c9660476a709e122cef18385c917532914a23f034388e1c1a52bde2be6",
+                ),
+            ),
+        )
+        """Pixel decoder, sized from the encoder's tokens; the published ViT-XL weights."""
 
         latent_norm: Makeable[LatentNormalizer] = field(
-            default_factory=ElementwiseLatentStats.Config,
+            default_factory=lambda: ElementwiseLatentStats.Config(
+                stats=HubFile.Config(
+                    repo_id="nyu-visionx/RAE-collections",
+                    filename="stats/dinov2/wReg_base/imagenet1k/stat.pt",
+                    revision="1be4f03273523431f099a934da4cf1940dc6039f",
+                    sha256="84ede66def5e6e3f25679334dc89cf63b12aacb99cbf0f5ae7ed4ad3187f7e59",
+                ),
+            ),
         )
-        """The published normalizer; the autoencoder itself never applies it."""
+        """The published ImageNet statistics; the autoencoder itself never applies them."""
 
         @override
         def finalize(self) -> Self:
@@ -763,19 +783,13 @@ class RAE(nn.Module):
                     f"divisible by the encoder patch {self.encoder.patch_size}.",
                 )
             grid = self.encoder_image_size // self.encoder.patch_size
-            decoder = self.decoder
-            if decoder.channels_in not in {-1, self.encoder.channels_hidden}:
-                raise ValueError(
-                    f"decoder.channels_in is {decoder.channels_in}, but the encoder "
-                    f"gives {self.encoder.channels_hidden}.",
-                )
-            if decoder.num_patches not in {-1, grid * grid}:
-                raise ValueError(
-                    f"decoder.num_patches is {decoder.num_patches}, but the encoder "
-                    f"gives {grid * grid}.",
-                )
-            decoder.channels_in = self.encoder.channels_hidden
-            decoder.num_patches = grid * grid
+            propagate_attr(
+                self.decoder,
+                "channels_in",
+                self.encoder.channels_hidden,
+                protocol=ChannelsIn,
+            )
+            propagate_attr(self.decoder, "num_patches", grid * grid)
             if self.decoder.patch_size * grid != self.image_size:
                 raise ValueError(
                     f"image_size {self.image_size} must be the decoder patch "
@@ -883,10 +897,6 @@ class RAE(nn.Module):
             grid = self.encoder_image_size // self.encoder.patch_size
             return self.encoder.channels_hidden, grid, grid
 
-        def default_latent_norm(self) -> Makeable[LatentNormalizer]:
-            """Return ``latent_norm``."""
-            return self.latent_norm
-
     def __init__(self, config: Config) -> None:
         super().__init__()
         self.encoder_image_size = config.encoder_image_size
@@ -896,12 +906,12 @@ class RAE(nn.Module):
         self.encoder_std: Tensor
         self.register_buffer(
             "encoder_mean",
-            torch.tensor(config.encoder.image_mean).view(1, 3, 1, 1),
+            torch.tensor(config.encoder.pixel_mean).view(1, 3, 1, 1),
             persistent=False,
         )
         self.register_buffer(
             "encoder_std",
-            torch.tensor(config.encoder.image_std).view(1, 3, 1, 1),
+            torch.tensor(config.encoder.pixel_std).view(1, 3, 1, 1),
             persistent=False,
         )
         self.decoder = config.decoder.make()
@@ -924,7 +934,7 @@ class RAE(nn.Module):
           latent: ``[B, channels_hidden, grid, grid]`` raw latent.
 
         """
-        pixels = image.float() / 255
+        pixels = rgb2float(image, float_dtype=torch.float32, unit_interval=True)
         _, _, height, width = pixels.shape
         side = self.encoder_image_size
         if height != side or width != side:
@@ -959,7 +969,7 @@ class RAE(nn.Module):
 
 
 def rae_dinov2_base() -> RAE.Config:
-    """Return the published DINOv2-B (registers) RAE with its ViT-XL decoder.
+    """Return the published DINOv2-B (registers) RAE, the :class:`RAE.Config` defaults.
 
     References:
       https://github.com/bytetriper/RAE/blob/a4d18c4db766419cbe7cb8c02cd9f7ceb0ec9041/configs/stage1/pretrained/DINOv2-B.yaml
@@ -968,23 +978,7 @@ def rae_dinov2_base() -> RAE.Config:
       config: Encoder, ``ViTXL_n08`` decoder, and ImageNet latent statistics.
 
     """
-    config = RAE.Config()
-    config.decoder.checkpoint = HubFile.Config(
-        repo_id="nyu-visionx/RAE-collections",
-        filename="decoders/dinov2/wReg_base/ViTXL_n08/model.pt",
-        revision="1be4f03273523431f099a934da4cf1940dc6039f",
-        sha256="5fedf7c9660476a709e122cef18385c917532914a23f034388e1c1a52bde2be6",
-    )
-    config.latent_norm = ElementwiseLatentStats.Config(
-        stats=HubFile.Config(
-            repo_id="nyu-visionx/RAE-collections",
-            filename="stats/dinov2/wReg_base/imagenet1k/stat.pt",
-            revision="1be4f03273523431f099a934da4cf1940dc6039f",
-            sha256="84ede66def5e6e3f25679334dc89cf63b12aacb99cbf0f5ae7ed4ad3187f7e59",
-        ),
-        eps=1e-5,
-    )
-    return config
+    return RAE.Config()
 
 
 def _vit_layer_cost(

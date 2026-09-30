@@ -38,6 +38,8 @@ def test_every_normalizer_satisfies_the_protocol(tmp_path: Path) -> None:
     )
     assert isinstance(ScaleLatents.Config().make(), LatentNormalizer)
     assert isinstance(ChannelLatentStats.Config(stats=stats).make(), LatentNormalizer)
+    var = _stats_file(tmp_path, var=torch.ones(3, 4, 4))
+    assert isinstance(ElementwiseLatentStats.Config(stats=var).make(), LatentNormalizer)
 
 
 def test_scale_is_one_multiply_each_way() -> None:
@@ -66,14 +68,22 @@ def test_elementwise_stats_follow_rae_order(tmp_path: Path) -> None:
 
 
 def test_elementwise_stats_skip_a_missing_mean(tmp_path: Path) -> None:
-    """RAE's 256px statistics carry no mean; nothing is subtracted, not zero."""
+    """RAE's 256px statistics carry no mean; the reference subtracts 0, exactly."""
     var = torch.full((3, 4, 4), 4.0)
     config = ElementwiseLatentStats.Config(
         stats=_stats_file(tmp_path, mean=None, var=var)
     )
     norm = config.make()
     latent = _latent()
-    assert torch.equal(norm.normalize(latent), latent / torch.sqrt(var + 1e-5))
+    assert torch.equal(norm.normalize(latent), (latent - 0) / torch.sqrt(var + 1e-5))
+    assert torch.equal(norm.denormalize(latent), latent * torch.sqrt(var + 1e-5) + 0)
+
+
+def test_elementwise_stats_refuse_a_missing_var(tmp_path: Path) -> None:
+    """The reference's ``else 1`` fallback raises in ``torch.sqrt``; so does this."""
+    config = ElementwiseLatentStats.Config(stats=_stats_file(tmp_path, mean=None))
+    with pytest.raises(ValueError, match="needs a var"):
+        _ = config.make()
 
 
 def test_channel_stats_follow_lightningdit_order(tmp_path: Path) -> None:

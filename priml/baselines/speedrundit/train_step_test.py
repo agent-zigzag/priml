@@ -79,7 +79,7 @@ class _SmokeSteps(nn.Module):
         smoke = exp_smoke()
         config = smoke.step
         # What SpeedrunTrainLoop.finalize fills; the step is built without the loop.
-        config.latent_norm = smoke.dataset.source.autoencoder.default_latent_norm()
+        config.latent_norm = smoke.dataset.source.autoencoder.latent_norm
         config.model.input_size = 4
         config.model.in_channels = 2
         # Size only. Eight channels over two heads keeps a real head axis. Three

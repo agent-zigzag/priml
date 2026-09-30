@@ -129,12 +129,11 @@ class VisionAutoencoderConfig(Makeable[Autoencoder], Protocol):
     image_size: int
     """Side of the square image the checkpoint was trained at."""
 
+    latent_norm: Makeable[LatentNormalizer]
+    """The normalizer published with this checkpoint; the autoencoder never applies it."""
+
     def latent_shape(self) -> tuple[int, int, int]:
         """Return ``(channels, height, width)`` of a latent at ``image_size``."""
-        ...
-
-    def default_latent_norm(self) -> Makeable[LatentNormalizer]:
-        """Return the normalizer published with this checkpoint."""
         ...
 
 

@@ -25,8 +25,11 @@ VTP.Config(
                         revision='d1726ca9abd5ed0b3ad938c508c635d8b1a51a31',
                         sha256='de5df2006083a9536c4d3ea36c6ae2181ec604e06550f1b2d7cece3b16aac32f'
                 ),
-                latent_stats=UrlFile.Config(
-                        url='https://raw.githubusercontent.com/MiniMax-AI/VTP/5ce1eb67010fff3c1eed483352483be6a1838556/generation/latent_stats/vtp_l/latents_stats.pt',
-                        sha256='0ad1fadbfb8959f3a93147a4db668b6d704ae36ff320bfad53cd3d568de7b0fd'
+                latent_norm=ChannelLatentStats.Config(
+                        stats=UrlFile.Config(
+                                url='https://raw.githubusercontent.com/MiniMax-AI/VTP/5ce1eb67010fff3c1eed483352483be6a1838556/generation/latent_stats/vtp_l/latents_stats.pt',
+                                sha256='0ad1fadbfb8959f3a93147a4db668b6d704ae36ff320bfad53cd3d568de7b0fd'
+                        ),
+                        multiplier=1.0
                 )
         )

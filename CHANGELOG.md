@@ -10,13 +10,14 @@ All notable priml changes are documented here. This project follows
 - `priml.model.vision_ae`: pretrained vision autoencoders behind one
   `Autoencoder` protocol (`encode` uint8 images to raw latents, `decode`
   back to `[0, 1]` pixels). `VariationalAutoencoder` adds `posterior`; the
-  latent a variational `encode` returns is the config's `latent` function
+  latent a variational `encode` returns is the config's `latent_fn`
   (`posterior_sample` or `posterior_mode`). Implementations: `INVAE`, `VTP`
-  (`vtp_small`, `vtp_base`, `vtp_large`), and `RAE` (`rae_dinov2_base`).
-  Checkpoints are config nodes (`HubFile`, `UrlFile`, `LocalFile`) pinned to
-  a revision and SHA-256; latent normalizers (`ScaleLatents`,
-  `ElementwiseLatentStats`, `ChannelLatentStats`) keep each reference's
-  operation order.
+  (`vtp_small`, `vtp_base`, `vtp_large`), and `RAE` (`rae_dinov2_base`),
+  each config defaulting to its published checkpoint. Checkpoints are config
+  nodes (`HubFile`, `UrlFile`, `LocalFile`) pinned to a revision and SHA-256;
+  each config's `latent_norm` holds its published normalizer
+  (`ScaleLatents`, `ElementwiseLatentStats`, `ChannelLatentStats`), which
+  keeps its reference's operation order.
 - `priml.math.scalar_quantization`: exact Lloyd-Max fitting on sorted
   samples, the cube-root high-resolution start, standard-normal levels, and
   batched nearest-level `quantize` / `dequantize`.
