@@ -172,7 +172,8 @@ def test_gaussian_fit_scales_the_unit_table_to_the_sample() -> None:
     values = 3 + 2 * torch.randn(4096, generator=torch.Generator().manual_seed(1))
     levels = GaussianFit.Config().make()(values)
     assert levels.mean().item() == pytest.approx(
-        values.double().mean().item(), abs=1e-6
+        values.double().mean().item(),
+        abs=1e-6,
     )
 
 

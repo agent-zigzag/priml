@@ -34,7 +34,8 @@ def test_gaussian_levels_reproduce_max_1960_table_for_eight_levels() -> None:
     """Max (1960), Table I, N = 8: outputs 0.2451, 0.7560, 1.344, 2.152."""
     levels = gaussian_levels(8, num_points=1 << 16)
     assert levels[4:].tolist() == pytest.approx(
-        [0.2451, 0.7560, 1.344, 2.152], abs=5e-4
+        [0.2451, 0.7560, 1.344, 2.152],
+        abs=5e-4,
     )
     assert midpoints(levels)[4:].tolist() == pytest.approx(
         [0.5006, 1.050, 1.748],

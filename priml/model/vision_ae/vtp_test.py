@@ -290,7 +290,7 @@ def test_latent_norm_standardizes_by_the_published_stats() -> None:
     assert norm.multiplier == 1.0
     assert isinstance(norm.stats, UrlFile.Config)
     assert norm.stats.url.endswith(
-        f"{_REFERENCE_COMMIT}/generation/latent_stats/vtp_l/latents_stats.pt"
+        f"{_REFERENCE_COMMIT}/generation/latent_stats/vtp_l/latents_stats.pt",
     )
 
 
@@ -375,7 +375,9 @@ def _round_trip(module: nn.Module, image: Tensor) -> Tensor:
 
 def test_vtp_large_config_pprint() -> None:
     assert_pprint_golden(
-        test_file=__file__, name="vtp_large_config", config=vtp_large()
+        test_file=__file__,
+        name="vtp_large_config",
+        config=vtp_large(),
     )
 
 

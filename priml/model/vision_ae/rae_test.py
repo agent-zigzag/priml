@@ -243,7 +243,11 @@ def test_rae_round_trip_cost_matches_torch(decoder_patch: int) -> None:
     generator = torch.Generator().manual_seed(0)
     side = config.image_size
     image = torch.randint(
-        0, 256, (2, 3, side, side), generator=generator, dtype=torch.uint8
+        0,
+        256,
+        (2, 3, side, side),
+        generator=generator,
+        dtype=torch.uint8,
     )
     with FlopCounterMode(display=False) as counter:
         _ = model.decode(model.encode(image))
@@ -384,7 +388,9 @@ def test_latent_norm_is_the_published_imagenet_stats() -> None:
 
 def test_rae_dinov2_base_config_pprint() -> None:
     assert_pprint_golden(
-        test_file=__file__, name="rae_config", config=rae_dinov2_base()
+        test_file=__file__,
+        name="rae_config",
+        config=rae_dinov2_base(),
     )
 
 

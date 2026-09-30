@@ -34,7 +34,9 @@ def _stats_file(tmp_path: Path, **stats: Tensor | None) -> LocalFile.Config:
 
 def test_every_normalizer_satisfies_the_protocol(tmp_path: Path) -> None:
     stats = _stats_file(
-        tmp_path, mean=torch.zeros(1, 3, 1, 1), std=torch.ones(1, 3, 1, 1)
+        tmp_path,
+        mean=torch.zeros(1, 3, 1, 1),
+        std=torch.ones(1, 3, 1, 1),
     )
     assert isinstance(ScaleLatents.Config().make(), LatentNormalizer)
     assert isinstance(ChannelLatentStats.Config(stats=stats).make(), LatentNormalizer)
@@ -59,7 +61,7 @@ def test_elementwise_stats_follow_rae_order(tmp_path: Path) -> None:
     mean = torch.rand(3, 4, 4, generator=torch.Generator().manual_seed(1))
     var = torch.rand(3, 4, 4, generator=torch.Generator().manual_seed(2)) + 0.1
     config = ElementwiseLatentStats.Config(
-        stats=_stats_file(tmp_path, mean=mean, var=var)
+        stats=_stats_file(tmp_path, mean=mean, var=var),
     )
     norm = config.make()
     latent = _latent()
@@ -71,7 +73,7 @@ def test_elementwise_stats_skip_a_missing_mean(tmp_path: Path) -> None:
     """RAE's 256px statistics carry no mean; the reference subtracts 0, exactly."""
     var = torch.full((3, 4, 4), 4.0)
     config = ElementwiseLatentStats.Config(
-        stats=_stats_file(tmp_path, mean=None, var=var)
+        stats=_stats_file(tmp_path, mean=None, var=var),
     )
     norm = config.make()
     latent = _latent()

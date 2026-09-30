@@ -94,7 +94,9 @@ class ElementwiseLatentStats:
         payload = cast(
             "dict[str, Tensor | None]",
             torch.load(
-                config.stats.make().path(), map_location="cpu", weights_only=True
+                config.stats.make().path(),
+                map_location="cpu",
+                weights_only=True,
             ),
         )
         var = payload.get("var")
@@ -161,7 +163,9 @@ class ChannelLatentStats:
         payload = cast(
             "dict[str, Tensor]",
             torch.load(
-                config.stats.make().path(), map_location="cpu", weights_only=True
+                config.stats.make().path(),
+                map_location="cpu",
+                weights_only=True,
             ),
         )
         self.mean = payload["mean"]

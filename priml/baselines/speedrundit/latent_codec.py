@@ -415,7 +415,7 @@ class ScalarTableCodec:
         thresholds = table["thresholds"].float()
         if levels.ndim != 2 or levels.shape[1] != NUM_LEVELS:
             raise ValueError(
-                f"levels must be [C, {NUM_LEVELS}]; got {tuple(levels.shape)}."
+                f"levels must be [C, {NUM_LEVELS}]; got {tuple(levels.shape)}.",
             )
         if thresholds.shape != (levels.shape[0], NUM_LEVELS - 1):
             raise ValueError("thresholds must be [C, 255], one row per level row.")

@@ -189,7 +189,8 @@ def load_table(directory: Path, codec: FittedCodec) -> str:
             f"{path} is missing: a fitted codec needs its table beside the corpus.",
         )
     table = cast(
-        "dict[str, Tensor]", torch.load(path, map_location="cpu", weights_only=True)
+        "dict[str, Tensor]",
+        torch.load(path, map_location="cpu", weights_only=True),
     )
     codec.load_table(table)
     return _sha256(path)

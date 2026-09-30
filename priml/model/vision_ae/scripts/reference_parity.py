@@ -960,7 +960,8 @@ def definitions(root: Path, relative: str) -> list[Definition]:
     def walk(node: ast.AST, prefix: str) -> None:
         for child in ast.iter_child_nodes(node):
             if not isinstance(
-                child, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef
+                child,
+                ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef,
             ):
                 continue
             name = f"{prefix}{child.name}"
@@ -972,7 +973,7 @@ def definitions(root: Path, relative: str) -> list[Definition]:
                     ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef,
                 ):
                     own -= set(
-                        range(inner.lineno, (inner.end_lineno or inner.lineno) + 1)
+                        range(inner.lineno, (inner.end_lineno or inner.lineno) + 1),
                     )
             found.append(
                 Definition(
@@ -1166,7 +1167,7 @@ class PinnedRandom:
         draw = self._draws.pop(0)
         if tuple(draw.shape) != shape:
             raise AssertionError(
-                f"torch.randn{shape} drawn; the pinned draw is {tuple(draw.shape)}"
+                f"torch.randn{shape} drawn; the pinned draw is {tuple(draw.shape)}",
             )
         return draw.to(device=cast("torch.device | str | None", kwargs.get("device")))
 
@@ -1257,7 +1258,7 @@ def compare(
             want_calls = [want_calls[i] for i in keep if i < len(want_calls)]
         if len(want_calls) != len(got_calls):
             problems.append(
-                f"{label} {name}: {len(got_calls)} calls vs {len(want_calls)}"
+                f"{label} {name}: {len(got_calls)} calls vs {len(want_calls)}",
             )
             continue
         for call, (want, got) in enumerate(zip(want_calls, got_calls, strict=True)):
@@ -1273,7 +1274,7 @@ def compare(
                     )
                 elif not torch.equal(a, b):
                     problems.append(
-                        f"{where}: {int((a != b).sum())}/{a.numel()} differ"
+                        f"{where}: {int((a != b).sum())}/{a.numel()} differ",
                     )
     return problems, len(shared)
 
@@ -1283,7 +1284,7 @@ def state_problems(label: str, theirs: nn.Module, ours: nn.Module) -> list[str]:
     want, got = theirs.state_dict(), ours.state_dict()
     if list(want) != list(got):
         return [
-            f"{label}: state keys differ: {list(got)[:4]}... vs {list(want)[:4]}..."
+            f"{label}: state keys differ: {list(got)[:4]}... vs {list(want)[:4]}...",
         ]
     return [
         f"{label}: {key} differs"
@@ -1375,7 +1376,11 @@ def run_invae(clone: Path, work: Path) -> Outcome:
     generator = torch.Generator().manual_seed(0)
     for index in range(2):
         image = torch.randint(
-            0, 256, (2, 3, 32, 32), generator=generator, dtype=torch.uint8
+            0,
+            256,
+            (2, 3, 32, 32),
+            generator=generator,
+            dtype=torch.uint8,
         )
         for draw in range(3):
             noise = torch.randn(2, 32, 2, 2, generator=generator)
@@ -1384,7 +1389,7 @@ def run_invae(clone: Path, work: Path) -> Outcome:
                 with PinnedRandom([noise]) as pinned, recorded(theirs) as their_modules:
                     # REG's own preprocessing: preprocessing/encoders.py, InvaeEncoder.encode.
                     upstream_posterior = their_invae.encode(
-                        image.to(torch.float32) / 127.5 - 1
+                        image.to(torch.float32) / 127.5 - 1,
                     )
                     their_sample = upstream_posterior.sample()
                     # REG's decode: generate.py, ``(samples + 1) / 2`` then a clamp.
@@ -1452,10 +1457,12 @@ def run_rae(clone: Path, work: Path) -> Outcome:
     sys.path.insert(0, str(clone / "src"))
     stage1 = cast("_Stage1Module", importlib.import_module("stage1"))
     upstream_decoder = cast(
-        "_DecoderModule", importlib.import_module("stage1.decoders.decoder")
+        "_DecoderModule",
+        importlib.import_module("stage1.decoders.decoder"),
     )
     utils = cast(
-        "_DecoderUtilsModule", importlib.import_module("stage1.decoders.utils")
+        "_DecoderUtilsModule",
+        importlib.import_module("stage1.decoders.utils"),
     )
     import transformers  # noqa: PLC0415 -- Heavy; only this model needs it.
 
@@ -1545,7 +1552,11 @@ def run_rae(clone: Path, work: Path) -> Outcome:
 
     generator = torch.Generator().manual_seed(0)
     large = torch.randint(
-        0, 256, (2, 3, 16, 16), generator=generator, dtype=torch.uint8
+        0,
+        256,
+        (2, 3, 16, 16),
+        generator=generator,
+        dtype=torch.uint8,
     )
     exact = torch.randint(
         0,
@@ -1563,7 +1574,7 @@ def run_rae(clone: Path, work: Path) -> Outcome:
         norm = None
         if stats is not None:
             norm = ElementwiseLatentStats.Config(
-                stats=LocalFile.Config(path=stats)
+                stats=LocalFile.Config(path=stats),
             ).make()
         for name, image in (("16px", large), ("8px", exact)):
             label = f"rae {name} stats={None if stats is None else stats.name}"
@@ -1729,7 +1740,8 @@ def run_vtp(clone: Path, work: Path) -> Outcome:
     golden = load_golden(_TESTDATA / "vtp.pt")
     state = golden["state_dict"]
     save_file(
-        {k: v.contiguous() for k, v in state.items()}, str(work / "vtp.safetensors")
+        {k: v.contiguous() for k, v in state.items()},
+        str(work / "vtp.safetensors"),
     )
     theirs = hf.VTPModel(
         hf.VTPConfig(
@@ -1759,16 +1771,18 @@ def run_vtp(clone: Path, work: Path) -> Outcome:
     mean, std = [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
     normalize = Normalize(mean, std)
     denormalize = Normalize(
-        [-m / s for m, s in zip(mean, std, strict=True)], [1 / s for s in std]
+        [-m / s for m, s in zip(mean, std, strict=True)],
+        [1 / s for s in std],
     )
 
     def theirs_round_trip(
-        image: Tensor, autocast: torch.dtype | None
+        image: Tensor,
+        autocast: torch.dtype | None,
     ) -> dict[str, Tensor]:
         # The reference's evaluation, tools/test_reconstruction_hf.py: ToTensor and
         # Normalize in, the encoder under autocast, the inverse Normalize and a clamp out.
         pixels_in = torch.stack(
-            [normalize(to_tensor(img.permute(1, 2, 0).numpy())) for img in image]
+            [normalize(to_tensor(img.permute(1, 2, 0).numpy())) for img in image],
         )
         cast_context = (
             nullcontext() if autocast is None else torch.autocast("cpu", dtype=autocast)
@@ -1889,7 +1903,10 @@ def main() -> int:
         str(_PRIML / "math" / "*.py"),
     ]
     measured = coverage.Coverage(
-        branch=True, data_file=None, include=include, config_file=False
+        branch=True,
+        data_file=None,
+        include=include,
+        config_file=False,
     )
     failed = False
     with tempfile.TemporaryDirectory() as scratch:
@@ -1913,10 +1930,12 @@ def main() -> int:
                         for line in mismatches(read_tensors(path), outcome.golden)
                     ]
             problems += inventory_problems(
-                reference, clone=clones[name], measured=measured
+                reference,
+                clone=clones[name],
+                measured=measured,
             )
             print(
-                f"== {name} at {reference.commit[:7]}: {outcome.compared} module outputs compared"
+                f"== {name} at {reference.commit[:7]}: {outcome.compared} module outputs compared",
             )
             if outcome.sites:
                 print(f"   torch.randn call sites: {dict(outcome.sites)}")

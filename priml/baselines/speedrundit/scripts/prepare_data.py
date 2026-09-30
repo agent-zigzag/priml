@@ -215,7 +215,10 @@ def prepare(
     error = _ErrorTally()
     pending = [r for r in listed if not _latent_path(latent_dir, r).is_file()]
     for batch, images in batches(
-        pending, root, config.autoencoder.image_size, batch_size
+        pending,
+        root,
+        config.autoencoder.image_size,
+        batch_size,
     ):
         latents = encode_latents(autoencoder, images, device)
         stored = codec.encode(latents)

@@ -338,7 +338,7 @@ class Dinov2WithRegisters(nn.Module):
             attn_implementation="eager",
         )
         self.encoder: Dinov2WithRegistersModel = transformers.Dinov2WithRegistersModel(
-            hf_config
+            hf_config,
         )
         mlp_class = transformers.models.dinov2_with_registers.modeling_dinov2_with_registers.Dinov2WithRegistersMLP
         for mlp in self.encoder.modules():
@@ -412,7 +412,9 @@ class ViTMAESelfAttention(nn.Module):
     def _heads(self, projected: Tensor) -> Tensor:
         """Split ``[B, N, C]`` into ``[B, heads, N, channels_head]``."""
         split = projected.view(
-            *projected.shape[:-1], self.num_heads, self.channels_head
+            *projected.shape[:-1],
+            self.num_heads,
+            self.channels_head,
         )
         return split.permute(0, 2, 1, 3)
 
@@ -448,7 +450,10 @@ class ViTMAEIntermediate(nn.Module):
     """MLP expansion and activation."""
 
     def __init__(
-        self, channels: int, channels_hidden: int, activation: TensorFn
+        self,
+        channels: int,
+        channels_hidden: int,
+        activation: TensorFn,
     ) -> None:
         super().__init__()
         self.dense = nn.Linear(channels, channels_hidden)
@@ -680,7 +685,7 @@ class GeneralDecoder(nn.Module):
         self.decoder_norm = nn.LayerNorm(config.channels_hidden, eps=config.eps)
         self.decoder_pred = nn.Linear(config.channels_hidden, config.patch_size**2 * 3)
         self.trainable_cls_token = nn.Parameter(
-            torch.zeros(1, 1, config.channels_hidden)
+            torch.zeros(1, 1, config.channels_hidden),
         )
         if config.checkpoint is not None:
             state = cast(

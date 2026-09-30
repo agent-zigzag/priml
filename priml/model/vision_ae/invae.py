@@ -881,7 +881,8 @@ class _Layers:
     def middle(self, channels: int, side: int) -> Cost:
         """Cost the ``mid`` stage: block, attention, block."""
         return self.resnet(channels, channels, side).tile(2, copies=2) + self.attention(
-            channels, side
+            channels,
+            side,
         )
 
     def head(self, channels_in: int, channels_out: int, side: int) -> Cost:

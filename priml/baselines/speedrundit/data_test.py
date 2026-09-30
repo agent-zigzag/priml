@@ -41,7 +41,11 @@ def _source(root: Path, **fields: object) -> PairedImageLatentDataset.Config:
 
 
 def _prepared_pair(
-    root: Path, name: str, label: int, *, subdir: str = "vae-in"
+    root: Path,
+    name: str,
+    label: int,
+    *,
+    subdir: str = "vae-in",
 ) -> None:
     image_dir = root / "images" / "00000"
     latent_dir = root / subdir / "00000"
