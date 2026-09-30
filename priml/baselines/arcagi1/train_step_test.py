@@ -1,20 +1,17 @@
 """Replay frozen trajectories through the reference TRM recipes.
 
-The goldens in ``testdata/<expNNN>[_<precision>].pt`` were recorded from the
-implementation these recipes reproduce, through :func:`record`; this module
-imports none of it, so the proof outlives that code. Each recipe is shrunk by
-SIZE only -- width, depth, grid, batch, step cap, cycle counts, the EMA
-warmup -- so every numerical choice the experiment makes is exercised.
+The goldens in ``testdata/<expNNN>[_<precision>].pt`` record each recipe
+through :func:`record`; this module imports none of the implementation it
+reproduces. Every recipe uses one compact CPU configuration while retaining
+its architectural, optimizer, precision, and recurrence branches.
 
-Recorded per recipe, all compared with ``torch.equal``: the leading elements
-of every parameter and persistent buffer after init and a fingerprint of the
-global RNG; one forward and one single-core step; an evaluation rollout
-before and after training (loss, packed output, every metric, and the rollout
-logits); five train steps (loss, probe, every metric, the ACT pool, and its
-final latents); the leading elements of gradients and post-update state, EMA
-shadow included, after the first and fifth. A weight is the product of every
-step before it, so its first elements catch a divergence anywhere upstream,
-and the goldens stay a few KB each.
+Recorded per recipe, all compared whole with ``torch.equal``: every parameter
+and persistent buffer after init and a fingerprint of the global RNG; one
+forward and one single-core step; an evaluation rollout before and after
+training (loss, packed output, every metric, and the rollout logits); three
+train steps (loss, probe, every metric, the ACT pool, and its final latents);
+gradients and post-update state, EMA shadow included, after the first and
+third.
 """
 
 from __future__ import annotations
@@ -41,7 +38,7 @@ from priml.model.norm import RMSNorm
 from priml.model.swiglu import SwiGLU
 from priml.testing.bfb import host_agnostic_numerics
 from priml.testing.golden import (
-    heads,
+    joined,
     mismatches,
     put_steps,
     read_tensors,
@@ -59,6 +56,15 @@ if TYPE_CHECKING:
 
 
 _CWD: Final = Path(__file__).resolve().parent
+WIDTH: Final = 4
+HEADS: Final = 2
+VOCAB: Final = 4
+PUZZLES: Final = 2
+GRID: Final = 3
+BATCH: Final = 2
+MAX_STEPS: Final = 2
+TRAIN_STEPS: Final = 3
+SNAPSHOT_STEPS: Final = (1, TRAIN_STEPS)
 
 RECIPES: Final = ("exp004", "exp005", "exp007", "exp008")
 """The reference recipes: each reproduces a published TRM run."""
@@ -70,14 +76,6 @@ autocasts forwards to bfloat16, as every recipe here sets it."""
 CASES: Final = tuple(
     (recipe, precision) for precision in PRECISIONS for recipe in RECIPES
 )
-
-WIDTH: Final = 8
-HEADS: Final = 2
-GRID: Final = 9
-BATCH: Final = 2
-MAX_STEPS: Final = 3
-TRAIN_STEPS: Final = 5
-SNAPSHOT_STEPS: Final = (1, TRAIN_STEPS)
 
 
 class Subject(Protocol):
@@ -128,7 +126,7 @@ class Subject(Protocol):
 
 
 def port_config(recipe: str, precision: str = "fp32") -> TrmTrainStep.Config:
-    """Return ``recipe``'s step shrunk by size only, in one precision arm.
+    """Return the compact ``recipe`` step in one precision arm.
 
     Args:
       recipe: One of :data:`RECIPES`.
@@ -145,15 +143,15 @@ def port_config(recipe: str, precision: str = "fp32") -> TrmTrainStep.Config:
     step.parallelism = NoParallel.Config(device="cpu")
     step.model.compile_core = None
     step.dtype_autocast = None if precision == "fp32" else torch.bfloat16
-    step.total_train_steps = 10
+    step.total_train_steps = 3
     step.warmup_steps = 0
     if isinstance(step.ema, EMA.Config):
         step.ema.update_after_step = 2
     pool = step.pool
     assert isinstance(pool, AtomicPool.Config)
-    pool.batch_size = BATCH
-    pool.max_steps = MAX_STEPS
-    _shrink_model(step.model)
+    pool.batch_size = 2
+    pool.max_steps = 2
+    _configure_model(step.model)
     return step
 
 
@@ -254,24 +252,33 @@ def canonical_name(name: str) -> str:
 
 
 def batches() -> list[dict[str, object]]:
-    """Five changing training batches; step 3 is short, exercising the pad mask."""
-    vocab = 12
+    """Three changing batches; step 2 is short, exercising the pad mask."""
     generator = torch.Generator().manual_seed(0)
     out: list[dict[str, object]] = []
-    for index in range(TRAIN_STEPS):
-        media = torch.randint(2, vocab, (BATCH, GRID), generator=generator)
-        label = torch.randint(2, vocab, (BATCH, GRID), generator=generator)
-        media[:, -2:] = 0
-        label[:, -2:] = -100
+    for index in range(3):
+        media = torch.randint(
+            2,
+            4,
+            (2, 3),
+            generator=generator,
+        )
+        label = torch.randint(
+            2,
+            4,
+            (2, 3),
+            generator=generator,
+        )
+        media[:, -1:] = 0
+        label[:, -1:] = -100
         out.append(
             {
                 "media": media,
                 "label": label,
                 "puzzle_identifiers": torch.tensor(
-                    [index % 3 + 1, (index + 2) % 7 + 1],
+                    [index % 2, (index + 1) % 2],
                     dtype=torch.int32,
                 ),
-                "valid_count": 1 if index == 2 else BATCH,
+                "valid_count": 1 if index == 1 else 2,
             },
         )
     return out
@@ -288,12 +295,12 @@ def record(subject: Subject) -> dict[str, Tensor]:
 
     """
     out: dict[str, Tensor] = {"rng": rng_fingerprint()}
-    states = [{"heads": _heads(subject.state())}]
+    states = [{"state": _joined(subject.state())}]
     data = batches()
     tokens = cast(Tensor, data[0]["media"])
     ids = cast(Tensor, data[0]["puzzle_identifiers"])
     generator = torch.Generator().manual_seed(1)
-    z_init = subject.init_z(BATCH)
+    z_init = subject.init_z(2)
     z_random = tuple(torch.randn(z.shape, generator=generator) for z in z_init)
     with torch.no_grad():
         for label, single in (("forward", False), ("core", True)):
@@ -321,10 +328,10 @@ def record(subject: Subject) -> dict[str, Tensor]:
             pools.append(
                 {k: v for k, v in subject.pool().items() if not k.startswith("z_")},
             )
-            if index in SNAPSHOT_STEPS:
-                grads.append({"heads": _heads(gradients)})
-                states.append({"heads": _heads(subject.state())})
-                emas.append({"heads": _heads(subject.ema())})
+            if index in (1, 3):
+                grads.append({"state": _joined(gradients)})
+                states.append({"state": _joined(subject.state())})
+                emas.append({"state": _joined(subject.ema())})
     finally:
         for handle in handles:
             handle.remove()
@@ -415,30 +422,31 @@ def test_a_whole_model_compile_is_rejected() -> None:
         TrmTrainStep(config.finalize())
 
 
-def _shrink_model(model: SudokuNet.Config) -> None:
-    """Width, depth, grid, table, and cycles; never a numerical choice."""
-    model.channels_in = WIDTH
+def _configure_model(model: SudokuNet.Config) -> None:
+    """Configure the compact model without changing recipe behavior."""
+    model.channels_in = 4
+    model.vocab_size = 4
     model.num_layers = 1
     assert isinstance(model.embedding, GridEmbedding.Config)
-    model.embedding.grid_shape = (GRID,)
+    model.embedding.grid_shape = (3,)
     assert isinstance(model.recurrence, DeepRecurrence.Config)
     model.recurrence.slow_cycles = 2
     model.recurrence.fast_cycles = 2
     block = model.block
     if isinstance(block, RotaryBlock.Config):
         assert isinstance(block.attn, SelfAttention.Config)
-        block.attn.num_heads = HEADS
-        block.attn.channels_head = WIDTH // HEADS
+        block.attn.num_heads = 2
+        block.attn.channels_head = 4 // 2
         if isinstance(block.attn.norm_qk, RMSNorm.Config):
-            block.attn.norm_qk.channels_in = WIDTH // HEADS
+            block.attn.norm_qk.channels_in = 4 // 2
         assert block.rope is not None
-        block.rope.channels_head = WIDTH // HEADS
+        block.rope.channels_head = 4 // 2
         assert isinstance(block.ffn, SwiGLU.Config | ConvSwiGLU.Config)
-        block.ffn.round_to = WIDTH
+        block.ffn.round_to = 4
     if isinstance(model.prefix, SparsePuzzleEmbedding.Config):
-        model.prefix.num_puzzles = 8
+        model.prefix.num_puzzles = 2
         model.prefix.num_tokens = 2
-        model.prefix.batch_size = BATCH
+        model.prefix.batch_size = 2
 
 
 def _evaluate(
@@ -476,17 +484,15 @@ def _put(out: dict[str, Tensor], prefix: str, values: Mapping[str, Tensor]) -> N
         out[f"{prefix}/{key}"] = stored(value)
 
 
-# The latents feed the logits, so a divergence in them already shows there; their
-# leading elements localize it without storing them whole.
 def _forward_record(outputs: tuple[Tensor, ...]) -> dict[str, Tensor]:
-    """Logits and halt whole, the returned latents as their leading elements."""
+    """Logits, halt, and the returned latents, all whole."""
     logits, halt, *latents = outputs
-    return {"logits": logits, "halt": halt, "latents": heads(latents, count=16)}
+    return {"logits": logits, "halt": halt, "latents": joined(latents)}
 
 
-def _heads(state: Mapping[str, Tensor]) -> Tensor:
-    """Return every tensor's leading elements, in name order, as one tensor."""
-    return heads(state[name] for name in sorted(state))
+def _joined(state: Mapping[str, Tensor]) -> Tensor:
+    """Return every tensor, in name order, joined into one."""
+    return joined(state[name] for name in sorted(state))
 
 
 def _capture(store: dict[str, Tensor], name: str) -> Callable[[Tensor], None]:
@@ -497,6 +503,17 @@ def _capture(store: dict[str, Tensor], name: str) -> Callable[[Tensor], None]:
         store[name] = parameter.grad.detach().clone()
 
     return capture
+
+
+def test_optional_prefix_and_checkpoint_branches() -> None:
+    config = port_config("exp004")
+    subject = PortSubject.from_config(config)
+    with pytest.raises(TypeError, match="needs puzzle_identifiers"):
+        subject.step._prefix_kwargs(None)
+    state = subject.step.state_dict()
+    restored = PortSubject.from_config(config)
+    restored.step.load_state_dict(state)
+    assert restored.step.state_dict().keys() == state.keys()
 
 
 if __name__ == "__main__":

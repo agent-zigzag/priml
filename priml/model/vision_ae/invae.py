@@ -165,7 +165,7 @@ class ResnetBlock(nn.Module):
                 )
 
     @override
-    def forward(self, x, temb):
+    def forward(self, x: Tensor, temb: Tensor | None) -> Tensor:
         h = x
         h = self.norm1(h)
         h = nonlinearity(h)
@@ -224,7 +224,7 @@ class AttnBlock(nn.Module):
         )
 
     @override
-    def forward(self, x):
+    def forward(self, x: Tensor) -> Tensor:
         h_ = x
         h_ = self.norm(h_)
         q = self.q(h_)

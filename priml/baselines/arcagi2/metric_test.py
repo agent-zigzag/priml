@@ -9,10 +9,17 @@ import json
 from torch import Tensor
 
 import numpy as np
+import pytest
 import torch
 
 from priml.baselines.arcagi1.augmentation import dihedral_transform
-from priml.baselines.arcagi2.metric import PassK
+from priml.baselines.arcagi2.metric import (
+    PassK,
+    _canonical,
+    _crop,
+    _hash,
+    _json_grid,
+)
 from priml.baselines.arcagi2.record_test import assert_matches, reduce
 
 
@@ -69,7 +76,8 @@ def record_votes(
 
     """
     permutation = np.array([0, 2, 1, 3, 4, 5, 6, 7, 8, 9], dtype=np.uint8)
-    media = torch.zeros(8, 4, 4, dtype=torch.int32)
+    # Eight views are required to cover every dihedral transform.
+    media = torch.zeros(8, 2, 2, dtype=torch.int32)
     predictions = torch.zeros_like(media)
     for index in range(8):
         for storage, grid in ((media, [[1, 2]]), (predictions, [[2], [1]])):
@@ -77,6 +85,7 @@ def record_votes(
             transformed_tensor = torch.from_numpy(transformed)
             rows, cols = transformed_tensor.shape
             storage[index, :rows, :cols] = transformed_tensor + 2
+    # PassK reserves one leading halt-logit column in packed scores.
     packed = torch.cat([torch.zeros(8, 1), predictions.flatten(1).float()], dim=1)
     batch = {"media": media.flatten(1), "puzzle_identifiers": torch.arange(1, 9)}
     metric = build(root)
@@ -96,6 +105,38 @@ def test_reference_metric(tmp_path: Path) -> None:
     assert record["scores/pass@1"].item() == 0.25
     assert record["scores/strict@1"].item() == 0.0
     assert torch.equal(record["scores/per_output@1"], torch.tensor(1 / 3))
+
+
+def test_metric_error_and_canonical_helpers() -> None:
+    metric = PassK.Config(working_dir="/opt/scratch/absent").make()
+    with pytest.raises(ValueError, match="one halt column"):
+        metric.update(
+            torch.zeros(2, 3),
+            media=torch.zeros(2, 3),
+            puzzle_identifiers=torch.zeros(2, dtype=torch.long),
+        )
+    with pytest.raises(ValueError, match="square"):
+        _crop(torch.zeros(3, dtype=torch.uint8))
+    with pytest.raises(ValueError, match="Invalid ARC color"):
+        _canonical("task|||t0|||bad", torch.zeros(2, 3, dtype=torch.uint8))
+    with pytest.raises(ValueError, match="Invalid ARC dihedral"):
+        _canonical("task|||t9|||0123456789", torch.zeros(2, 3, dtype=torch.uint8))
+    assert _hash(torch.zeros(2, 3, dtype=torch.uint8))
+    assert _json_grid([[1, 2, 3], [4, 5, 6]]).shape == (2, 3)
+
+
+def test_global_vote_gather(monkeypatch: pytest.MonkeyPatch) -> None:
+
+    candidate = PassK.Config().make()
+    candidate.votes = {"task": {"input": [("output", 0.5)]}}
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 1)
+
+    def gather(output: list[object], value: object) -> None:
+        output[0] = value
+
+    monkeypatch.setattr(torch.distributed, "all_gather_object", gather)
+    assert candidate._global_votes() == candidate.votes
 
 
 if __name__ == "__main__":

@@ -7,6 +7,7 @@ from torch import Tensor, nn
 import pytest
 import torch
 
+from priml.baselines.nanochat import ngram
 from priml.baselines.nanochat.ngram import (
     HashedNgramTables,
     NgramEmbedding,
@@ -15,6 +16,19 @@ from priml.baselines.nanochat.ngram import (
 )
 from priml.model.embedding import Embedding
 from priml.testing.cost import assert_cost_matches_torch
+
+
+class _FakeKernel:
+    def __getitem__(self, grid: tuple[int, ...]) -> _FakeKernel:
+        del grid
+        return self
+
+    def __call__(self, *args: object, **kwargs: object) -> None:
+        del args, kwargs
+
+
+def _fake_kernel() -> _FakeKernel:
+    return _FakeKernel()
 
 
 def test_ngram_embedding_zeros_incomplete_prefix_and_receives_gradients() -> None:
@@ -28,18 +42,19 @@ def test_ngram_embedding_zeros_incomplete_prefix_and_receives_gradients() -> Non
     with torch.no_grad():
         built.inner.weight.copy_(torch.arange(26).reshape(13, 2))
 
-    tokens = torch.tensor([[1, 2, 3, 4]])
+    tokens = torch.tensor([[1, 2, 3, 4], [4, 3, 2, 1], [2, 4, 1, 3]])
     output = built(tokens)
-    expected = torch.zeros(1, 4, 2)
+    expected = torch.zeros(3, 4, 2)
     for position in range(2, 4):
-        bucket = (
-            sum(
-                int(tokens[0, position - lag]) * multiplier
-                for lag, multiplier in enumerate(config.multipliers)
+        for row in range(3):
+            bucket = (
+                sum(
+                    int(tokens[row, position - lag]) * multiplier
+                    for lag, multiplier in enumerate(config.multipliers)
+                )
+                % config.channels_in
             )
-            % config.channels_in
-        )
-        expected[0, position] = torch.tensor([2 * bucket, 2 * bucket + 1]) * 0.25
+            expected[row, position] = torch.tensor([2 * bucket, 2 * bucket + 1]) * 0.25
     assert torch.equal(output, expected)
     output.sum().backward()
     assert isinstance(built.inner.weight.grad, Tensor)
@@ -220,10 +235,10 @@ def test_gradient_buffers_follow_placement_without_narrowing() -> None:
 
 def test_fused_mix_accumulates_fp32_sinks_without_weight_gradients() -> None:
     torch.manual_seed(17)
-    values = torch.randn(1, 3, 2, 2, requires_grad=True)
-    gate = torch.randn(1, 3, 2, requires_grad=True)
-    weights = [torch.randn(5, 2, requires_grad=True) for _ in range(2)]
-    indices = [torch.tensor([[1, 1, 3]]) for _ in weights]
+    values = torch.randn(3, 4, 2, 5, requires_grad=True)
+    gate = torch.randn(3, 4, 2, requires_grad=True)
+    weights = [torch.randn(6, 5, requires_grad=True) for _ in range(2)]
+    indices = [torch.tensor([[1, 1, 3, 2]]).expand(3, -1).contiguous() for _ in weights]
     sinks = [torch.zeros_like(weight, dtype=torch.float32) for weight in weights]
     bitmaps = [torch.zeros(weight.shape[0], dtype=torch.uint8) for weight in weights]
 
@@ -235,8 +250,8 @@ def test_fused_mix_accumulates_fp32_sinks_without_weight_gradients() -> None:
     assert all(sink.dtype == torch.float32 for sink in sinks)
     assert all(torch.count_nonzero(sink) > 0 for sink in sinks)
     assert [bitmap.nonzero().flatten().tolist() for bitmap in bitmaps] == [
-        [1, 3],
-        [1, 3],
+        [1, 2, 3],
+        [1, 2, 3],
     ]
 
     before = [weight.detach().clone() for weight in weights]
@@ -260,23 +275,26 @@ def test_cuda_fused_mix_matches_autograd_and_marks_rows(sources: int) -> None:
         pytest.skip("Requires a CUDA device.")
     torch.manual_seed(31)
     values = torch.randn(
-        1,
+        3,
         17,
-        2,
+        4,
         2,
         device="cuda",
         dtype=torch.bfloat16,
         requires_grad=True,
     )
     gates = [
-        torch.randn(1, 17, 2, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        torch.randn(3, 17, 4, device="cuda", dtype=torch.bfloat16, requires_grad=True)
         for _ in range(sources)
     ]
     weights = [
-        torch.randn(32, 2, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        torch.randn(32, 4, device="cuda", dtype=torch.bfloat16, requires_grad=True)
         for _ in range(2 * sources)
     ]
-    indices = [torch.arange(17, device="cuda")[None] % 5 for _ in weights]
+    indices = [
+        (torch.arange(17, device="cuda")[None] % 5).expand(3, -1).contiguous()
+        for _ in weights
+    ]
     sinks = [torch.zeros_like(weight, dtype=torch.float32) for weight in weights]
     bitmaps = [
         torch.zeros(weight.shape[0], device="cuda", dtype=torch.uint8)
@@ -332,6 +350,167 @@ def test_cuda_fused_mix_matches_autograd_and_marks_rows(sources: int) -> None:
     clear_marked_sinks(sinks, bitmaps)
     assert all(torch.count_nonzero(sink) == 0 for sink in sinks)
     assert all(torch.count_nonzero(bitmap) == 0 for bitmap in bitmaps)
+
+
+def test_ngram_configs_validate_hash_geometry() -> None:
+    with pytest.raises(ValueError, match="divide"):
+        HashedNgramTables.Config(channels_out=3, hash_multipliers=((1,), (1,))).make()
+    with pytest.raises(ValueError, match="same n-gram"):
+        HashedNgramTables.Config(channels_out=4, hash_multipliers=((1,), (1, 2))).make()
+
+
+def test_ngram_mix_rejects_bad_inputs() -> None:
+    value = torch.zeros(2, 3, 4, 6)
+    gate = torch.zeros(2, 3, 4)
+    weight = torch.zeros(5, 12)
+    index = torch.zeros(2, 3, dtype=torch.long)
+    sink = torch.zeros_like(weight)
+    with pytest.raises(ValueError, match="1 <= len"):
+        ngram_mix(value, [], [], [], [], [])
+    with pytest.raises(ValueError, match="ndim"):
+        ngram_mix(
+            torch.zeros(2, 3, 4),
+            [gate],
+            [weight, weight],
+            [index, index],
+            [sink, sink],
+            [],
+        )
+    with pytest.raises(ValueError, match="dtype"):
+        ngram_mix(
+            value,
+            [gate],
+            [weight, weight],
+            [index, index],
+            [sink.half(), sink],
+            [],
+        )
+    with pytest.raises(ValueError, match="shape"):
+        ngram_mix(
+            value,
+            [gate],
+            [weight, weight],
+            [index, index],
+            [torch.zeros(4, 2), sink],
+            [],
+        )
+    with pytest.raises(ValueError, match=r"index\.numel"):
+        ngram_mix(
+            value,
+            [gate],
+            [weight, weight],
+            [torch.zeros(2, 4, dtype=torch.long), index],
+            [sink, sink],
+            [],
+        )
+    with pytest.raises(ValueError, match=r"gate\.shape"):
+        ngram_mix(
+            value,
+            [torch.zeros(2, 3, 5)],
+            [weight, weight],
+            [index, index],
+            [sink, sink],
+            [],
+        )
+    with pytest.raises(ValueError, match="len\\(weights\\)"):
+        ngram_mix(value, [gate], [weight], [index], [sink], [])
+    with pytest.raises(ValueError, match="contiguous"):
+        ngram_mix(
+            value.transpose(-1, -2),
+            [gate],
+            [weight, weight],
+            [index, index],
+            [sink, sink],
+            [],
+        )
+    with pytest.raises(ValueError, match=r"index\.dtype"):
+        ngram_mix(
+            value,
+            [gate],
+            [weight, weight],
+            [index.to(torch.int32), index],
+            [sink, sink],
+            [],
+        )
+    with pytest.raises(ValueError, match=r"w\.shape"):
+        ngram_mix(
+            value,
+            [gate],
+            [torch.zeros(3, 12), weight],
+            [index, index],
+            [sink, sink],
+            [],
+        )
+    noncontiguous_sink = torch.zeros(12, 5).transpose(0, 1)
+    with pytest.raises(ValueError, match=r"s\.is_contiguous"):
+        ngram_mix(
+            value,
+            [gate],
+            [weight, weight],
+            [index, index],
+            [noncontiguous_sink, sink],
+            [],
+        )
+    with pytest.raises(ValueError, match=r"w\.dtype"):
+        ngram_mix(
+            value.half(),
+            [gate],
+            [weight, weight],
+            [index, index],
+            [sink, sink],
+            [],
+        )
+    with pytest.raises(ValueError, match=r"index\.is_contiguous"):
+        ngram_mix(value, [gate], [weight, weight], [index.t(), index], [sink, sink], [])
+    with pytest.raises(ValueError, match=r"gate\.numel"):
+        ngram_mix(
+            value,
+            [torch.zeros(2, 6, 4)],
+            [weight, weight],
+            [index, index],
+            [sink, sink],
+            [],
+        )
+
+
+def test_cpu_backward_reference_and_empty_sink_clear() -> None:
+    values = torch.randn(2, 3, 4, 6)
+    gate = torch.randn(2, 3, 4)
+    weights = [torch.randn(13, 12) for _ in range(2)]
+    indices = [torch.tensor([[1, 2, 3], [4, 5, 6]]) for _ in weights]
+    sinks = [torch.zeros_like(weight) for weight in weights]
+    gradients = ngram._mix_backward_reference(values, [gate], weights, indices, sinks)
+    assert gradients[0].shape == gate.shape
+    assert all(torch.count_nonzero(sink) > 0 for sink in sinks)
+    clear_marked_sinks([], [])
+
+
+def test_ngram_cuda_host_dispatch_accepts_cpu_fixture(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    values = torch.randn(2, 3, 4, 6)
+    gate = torch.randn(2, 3, 4)
+    # _clear_marked_sinks_cuda needs rows divisible by its 8-row program.
+    weights = [torch.randn(16, 12) for _ in range(2)]
+    indices = [torch.tensor([[1, 2, 3], [4, 5, 6]]) for _ in weights]
+    sinks = [torch.zeros_like(weight) for weight in weights]
+    bitmaps = [torch.zeros(16, dtype=torch.uint8) for _ in weights]
+    monkeypatch.setattr(ngram, "_compiled_ngram_forward", _fake_kernel)
+    monkeypatch.setattr(ngram, "_compiled_ngram_backward", _fake_kernel)
+    monkeypatch.setattr(ngram, "_compiled_sink_clear", _fake_kernel)
+    assert (
+        ngram._mix_forward_cuda(values, [gate], weights, indices).shape == values.shape
+    )
+    gradients = ngram._mix_backward_cuda(
+        values,
+        [gate],
+        weights,
+        indices,
+        sinks,
+        bitmaps=bitmaps,
+    )
+    assert gradients[0].shape == gate.shape
+    ngram._clear_marked_sinks_cuda(sinks, bitmaps)
 
 
 if __name__ == "__main__":

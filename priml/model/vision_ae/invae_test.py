@@ -6,7 +6,7 @@ here is the proof that the move changed no arithmetic.
 
 Parity with REG's own ``models/invae.py`` is ``scripts/reference_parity.py``'s,
 not a golden's: REG hardcodes 32 GroupNorm groups, so the smallest model it
-builds is far over the 28,000-byte golden ceiling.
+builds is far over the 32,768-byte golden ceiling.
 """
 
 from __future__ import annotations
@@ -26,7 +26,16 @@ from priml.model.vision_ae.custom_types import (
     VariationalAutoencoder,
     posterior_mode,
 )
-from priml.model.vision_ae.invae import INVAE
+from priml.model.vision_ae.invae import (
+    INVAE,
+    AttnBlock,
+    Decoder,
+    DiagonalGaussianDistribution,
+    Downsample,
+    Encoder,
+    ResnetBlock,
+    Upsample,
+)
 from priml.model.vision_ae.latent_norm import ScaleLatents
 from priml.testing.bfb import assert_bfb_against_golden
 from priml.testing.cost import assert_cost_matches_torch
@@ -219,7 +228,71 @@ def test_encode_refuses_a_float_image() -> None:
     """A ``[0, 1]`` float image would otherwise encode as near-black."""
     model = tiny().make()
     with pytest.raises(TypeError, match="uint8"):
-        _ = model.encode(torch.rand(1, 3, 16, 16))
+        _ = model.encode(torch.rand(2, 3, 4, 5))
+
+
+def test_resamplers_and_residual_shortcuts_run_every_branch() -> None:
+    """The reference's options INVAE never sets still build and run.
+
+    Resampling without a convolution, a time embedding, and a convolutional
+    shortcut are the branches ``scripts/reference_parity.py`` allowlists as
+    unreached on the published path.
+    """
+    x = torch.randn(2, 32, 4, 6)
+    assert Upsample(32, with_conv=True)(x).shape == (2, 32, 8, 12)
+    assert Upsample(32, with_conv=False)(x).shape == (2, 32, 8, 12)
+    assert Downsample(32, with_conv=True)(x).shape == (2, 32, 2, 3)
+    assert Downsample(32, with_conv=False)(x).shape == (2, 32, 2, 3)
+    shortcut = ResnetBlock(
+        in_channels=32,
+        out_channels=64,
+        conv_shortcut=True,
+        dropout=0.0,
+        temb_channels=7,
+    )
+    assert shortcut(x, torch.randn(2, 7)).shape == (2, 64, 4, 6)
+    projected = ResnetBlock(
+        in_channels=32,
+        out_channels=64,
+        conv_shortcut=False,
+        dropout=0.0,
+        temb_channels=0,
+    )
+    assert projected(x, None).shape == (2, 64, 4, 6)
+    assert AttnBlock(32)(x).shape == x.shape
+
+
+def test_encoder_and_decoder_keep_non_square_grids() -> None:
+    encoder = Encoder(
+        ch=32,
+        ch_mult=(1, 2),
+        num_res_blocks=1,
+        attn_resolutions=(4,),
+        resolution=8,
+        z_channels=2,
+        double_z=True,
+    )
+    assert encoder(torch.randn(2, 3, 8, 10)).shape == (2, 2 * 2, 4, 5)
+    decoder = Decoder(
+        ch=32,
+        ch_mult=(1, 2),
+        num_res_blocks=1,
+        attn_resolutions=(4,),
+        resolution=8,
+        z_channels=2,
+        out_ch=3,
+    )
+    latent = torch.randn(6, 2, 4, 5)
+    assert decoder(latent).shape == (6, 3, 8, 10)
+    decoder.give_pre_end = True
+    assert decoder(latent).shape == (6, 32, 8, 10)
+
+
+def test_posterior_draws_its_shape_and_its_mode_is_the_mean() -> None:
+    moments = torch.randn(2, 2 * 3, 4, 5, generator=torch.Generator().manual_seed(0))
+    posterior = DiagonalGaussianDistribution(moments)
+    assert posterior.sample().shape == (2, 3, 4, 5)
+    assert torch.equal(posterior.mode(), posterior.mean)
 
 
 if __name__ == "__main__":

@@ -2,11 +2,18 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from torch import Tensor
 
 import torch
+import torch.distributed as dist
 
 from priml.baselines.sudoku.metric import GridAccuracy
+
+
+if TYPE_CHECKING:
+    import pytest
 
 
 def _packed(predictions: Tensor, prefix: int = 1) -> Tensor:
@@ -65,13 +72,13 @@ def test_valid_count_truncates_before_scoring() -> None:
 def test_counts_accumulate_across_batches() -> None:
     """Ratios are computed once at the end, not averaged per batch."""
     metric = GridAccuracy.Config().make()
-    labels = torch.full((1, 9), 3, dtype=torch.int64)
+    labels = torch.full((2, 9), 3, dtype=torch.int64)
     metric.update(_packed(labels.clone()), label=labels)  # Solved.
     wrong = labels.clone()
     wrong[0, 0] = 5
     metric.update(_packed(wrong), label=labels)  # Not solved.
     metric.update(_packed(wrong), label=labels)  # Not solved.
-    assert metric.compute()["exact"] == 1 / 3
+    assert metric.compute()["exact"] == 2 / 3
 
 
 def test_empty_metric_reports_zero_not_a_division_error() -> None:
@@ -80,7 +87,7 @@ def test_empty_metric_reports_zero_not_a_division_error() -> None:
 
 def test_state_round_trips() -> None:
     metric = GridAccuracy.Config().make()
-    labels = torch.full((1, 9), 3, dtype=torch.int64)
+    labels = torch.full((2, 9), 3, dtype=torch.int64)
     metric.update(_packed(labels.clone()), label=labels)
     state = metric.state_dict()
 
@@ -89,9 +96,25 @@ def test_state_round_trips() -> None:
     assert restored.compute() == metric.compute()
 
 
+def test_compute_reduces_initialized_gloo_counts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    metric = GridAccuracy.Config().make()
+    labels = torch.full((2, 9), 3, dtype=torch.int64)
+    metric.update(_packed(labels), label=labels)
+
+    def fake_all_reduce(counts: Tensor, **_kwargs: object) -> None:
+        del counts
+
+    monkeypatch.setattr(dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(dist, "get_backend", lambda: "gloo")
+    monkeypatch.setattr(dist, "all_reduce", fake_all_reduce)
+    assert metric.compute() == {"exact": 1.0, "cell": 1.0}
+
+
 def test_reset_clears_every_count() -> None:
     metric = GridAccuracy.Config().make()
-    labels = torch.full((1, 9), 3, dtype=torch.int64)
+    labels = torch.full((2, 9), 3, dtype=torch.int64)
     metric.update(_packed(labels.clone()), label=labels)
     metric.reset()
     assert metric.compute() == {"exact": 0.0, "cell": 0.0}

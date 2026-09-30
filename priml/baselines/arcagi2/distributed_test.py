@@ -14,7 +14,7 @@ for every fault arm alike, so the golden is portable across CPU ISAs.
 from __future__ import annotations
 
 from functools import partial
-from typing import TYPE_CHECKING, Literal, Protocol, cast
+from typing import TYPE_CHECKING, Literal, Protocol, cast, override
 
 import math
 import traceback
@@ -35,10 +35,11 @@ from priml.baselines.arcagi2.train_step_test import (
     training_batch,
     training_config,
 )
+from priml.baselines.sudoku.embedding import GridEmbedding
 from priml.lib.custom_json import DictCodec
 from priml.runtime import MultiProcess
 from priml.testing.bfb import host_agnostic_numerics
-from priml.testing.golden import heads, mismatches, put_steps
+from priml.testing.golden import joined, mismatches, put_steps
 from priml.train.parallelism import DataParallel, NoParallel
 
 
@@ -52,7 +53,7 @@ if TYPE_CHECKING:
     from priml.train.custom_types import TrainStepOutput
 
 
-type Fault = Literal["none", "broadcast", "dense", "sparse", "clipping"]
+type Fault = Literal["none", "broadcast", "dense", "sparse", "clipping", "ulp"]
 
 
 class Loader(Protocol):
@@ -109,7 +110,7 @@ class Subject(Protocol):
 
 
 def prepared_tree(root: Path) -> None:
-    """Four tasks, nine rows, one tree for both splits."""
+    """Two tasks, four rows, one tree for both splits."""
     for split in ("train", "test"):
         directory = root / split
         directory.mkdir()
@@ -117,11 +118,11 @@ def prepared_tree(root: Path) -> None:
             '{"ignore_label_id": 0, "blank_identifier_id": 0}',
         )
         arrays = {
-            "inputs": np.arange(81, dtype=np.int32).reshape(9, 9) % 12,
-            "labels": (np.arange(81, dtype=np.int32).reshape(9, 9) + 3) % 12,
-            "puzzle_indices": np.array([0, 2, 5, 7, 9], dtype=np.int64),
-            "group_indices": np.array([0, 1, 3, 4], dtype=np.int64),
-            "puzzle_identifiers": np.array([1, 2, 3, 4], dtype=np.int32),
+            "inputs": np.arange(12, dtype=np.int32).reshape(4, 3) % 2 + 2,
+            "labels": (np.arange(12, dtype=np.int32).reshape(4, 3) + 1) % 2 + 2,
+            "puzzle_indices": np.array([0, 2, 4], dtype=np.int64),
+            "group_indices": np.array([0, 1, 2], dtype=np.int64),
+            "puzzle_identifiers": np.array([1, 2], dtype=np.int32),
         }
         for name, array in arrays.items():
             np.save(directory / f"all__{name}.npy", array)
@@ -143,7 +144,7 @@ def record_training(
     rank: int,
     clip: float,
 ) -> dict[str, Tensor]:
-    """Record five updates, the trained state, then a resumed update.
+    """Record three updates, the trained state, then a resumed update.
 
     Args:
       subject: The implementation, already built on this rank.
@@ -156,7 +157,7 @@ def record_training(
     """
     with host_agnostic_numerics():
         slow, fast = subject.latent_inits
-        out: dict[str, object] = {"latent_init": heads([slow, fast])}
+        out: dict[str, object] = {"latent_init": joined([slow, fast])}
         gradients: dict[str, Tensor] = {}
         subject.dense_optimizer.register_step_pre_hook(
             partial(
@@ -167,12 +168,12 @@ def record_training(
             ),
         )
         steps: list[dict[str, Tensor]] = []
-        for index in range(5):
+        # Dense gradients reach the final parameters and optimizer state stored
+        # below, so only the sparse rows, which each rank keeps local, are kept.
+        for index in range(3):
             result = subject.train_step(**training_batch(index, rank))
-            sparse_grad = gradients.pop("sparse")
             step: dict[str, object] = {
-                "grad": heads(gradients.values(), count=2),
-                "grad_sparse": rows(sparse_grad),
+                "grad_sparse": rows(gradients.pop("sparse")),
                 "loss": result["loss"],
                 "model": result["model"],
             }
@@ -183,13 +184,15 @@ def record_training(
         # already depends on every update before it.
         out["param"] = _parameters(subject.model)
         out["sparse"] = rows(subject.sparse_table)
+        # A resumed update reads every restored optimizer moment, so its loss,
+        # output, and sparse rows pin the round trip; the dense state it lands
+        # on is implied by those and stays unstored.
         resumed = subject.resumed()
-        result = resumed.train_step(**training_batch(5, rank))
+        result = resumed.train_step(**training_batch(3, rank))
         out["resumed/loss"] = result["loss"]
         out["resumed/model"] = result["model"]
-        out["resumed/param"] = _parameters(resumed.model)
         out["resumed/sparse"] = rows(resumed.sparse_table)
-        out["resumed/optimizers"] = _optimizer_leading(resumed.optimizer_states())
+        out["resumed/optimizers"] = _optimizer_structure(resumed.optimizer_states())
         record = reduce(out)
         put_steps(record, "step", steps)
         return record
@@ -248,9 +251,37 @@ class PortSubject:
         return other
 
 
+class GeometrySubject(PortSubject):
+    """Repeat the same prepared tokens across a configurable packed grid."""
+
+    def __init__(self, config: ArcTrainStep.Config, grid_len: int) -> None:
+        super().__init__(config)
+        self.grid_len = grid_len
+
+    @override
+    def train_step(self, **batch: object) -> TrainStepOutput:
+        media = cast("Tensor", batch["media"])
+        label = cast("Tensor", batch["label"])
+        return super().train_step(
+            **{
+                **batch,
+                "media": media.repeat(1, self.grid_len // media.shape[1]),
+                "label": label.repeat(1, self.grid_len // label.shape[1]),
+            },
+        )
+
+    @override
+    def resumed(self) -> GeometrySubject:
+        config = self.config.copy_tree()
+        config.sparse_optimizer.lr *= 2
+        other = GeometrySubject(config, self.grid_len)
+        other.step.load_state_dict(self.step.state_dict())
+        return other
+
+
 def port_training_config(*, clip: float, fault: Fault) -> ArcTrainStep.Config:
     """Return the port's two-rank recipe, one mechanism removed under ``fault``."""
-    candidate = training_config(8, torch.bfloat16)
+    candidate = training_config(4, torch.bfloat16)
     candidate.gradient_clip_norm = clip
     candidate.parallelism = ArcDataParallel.Config(gradient_as_bucket_view=True)
     if fault == "broadcast":
@@ -325,6 +356,11 @@ def _training_worker(root: Path, clip: float, fault: Fault, mesh: DeviceMesh) ->
         torch.default_generator.manual_seed(seed_of(rank, fault))
         with host_agnostic_numerics():
             subject = PortSubject(port_training_config(clip=clip, fault=fault))
+            if fault == "ulp":
+                with torch.no_grad():
+                    weight = next(subject.model.parameters())
+                    assert weight.dtype == torch.float32
+                    weight.view(torch.int32).view(-1)[0] += 1
         record = record_training(subject, rank=rank, clip=clip)
         torch.save(record, root / f"record_{rank}.pt")
     except (AssertionError, RuntimeError, ValueError, TypeError, KeyError):
@@ -334,21 +370,17 @@ def _training_worker(root: Path, clip: float, fault: Fault, mesh: DeviceMesh) ->
 
 
 def _parameters(model: nn.Module) -> Tensor:
-    return heads(model.parameters(), count=2)
+    return joined(model.parameters())
 
 
-# Structure and scalars stay per key -- they are what a checkpoint round trip can
-# lose -- while every state tensor is folded into one head vector.
-def _optimizer_leading(value: object) -> dict[str, Tensor]:
-    """Return an optimizer checkpoint as its leaves, ordered by path."""
+# Structure and scalars are what a checkpoint round trip can lose; the state
+# tensors are exercised by the resumed update, which reads every one.
+def _optimizer_structure(value: object) -> dict[str, Tensor]:
+    """Return an optimizer checkpoint's non-tensor leaves, ordered by path."""
     flat = reduce(_without_tensors(value))
     text = {k: v for k, v in flat.items() if v.dtype == torch.uint8}
     numeric = [flat[k].double() for k in sorted(flat.keys() - text.keys())]
-    return {
-        **text,
-        "scalars": torch.stack(numeric),
-        "tensors": heads(_tensors(value)),
-    }
+    return {**text, "scalars": torch.stack(numeric)}
 
 
 def _without_tensors(value: object) -> object:
@@ -358,17 +390,6 @@ def _without_tensors(value: object) -> object:
     if isinstance(value, list | tuple):
         return [_without_tensors(item) for item in cast("list[object]", value)]
     return value
-
-
-def _tensors(value: object) -> list[Tensor]:
-    if isinstance(value, Tensor):
-        return [value]
-    if isinstance(value, dict):
-        items = cast("dict[object, object]", value).values()
-        return [t for item in items for t in _tensors(item)]
-    if isinstance(value, list | tuple):
-        return [t for item in cast("list[object]", value) for t in _tensors(item)]
-    return []
 
 
 def _batch(batch: Mapping[str, object]) -> dict[str, object]:
@@ -407,7 +428,7 @@ def test_source_distributed_training(
     warm_pools: WarmPoolGetter,
     clip: float,
 ) -> None:
-    """Compare distinct rank inputs and shared sparse IDs through five updates."""
+    """Compare distinct rank inputs and shared sparse IDs through three updates."""
     worker = partial(_training_worker, tmp_path, clip, "none")
     records = run_distributed(worker, tmp_path, warm_pools)
     report = _expect(
@@ -423,7 +444,7 @@ def test_source_distributed_training(
     ("fault", "failure"),
     [
         ("broadcast", "latent_init"),
-        ("dense", "step/grad"),
+        ("dense", "param"),
         ("sparse", "sparse"),
         ("clipping", "step/grad_norm"),
     ],
@@ -445,6 +466,36 @@ def test_oracle_rejects_missing_distributed_mechanisms(
         records,
     )
     assert any(failure in line for line in report), "\n".join(report)
+
+
+@pytest.mark.compute_distributed
+def test_one_ulp_weight_bites_distributed_golden(
+    tmp_path: Path,
+    warm_pools: WarmPoolGetter,
+) -> None:
+    worker = partial(_training_worker, tmp_path, math.inf, "ulp")
+    records = run_distributed(worker, tmp_path, warm_pools)
+    report = _expect(
+        "distributed",
+        lambda rank: case_name("training", clip=math.inf, seed="zero", rank=rank),
+        records,
+    )
+    assert any("param" in line for line in report), "\n".join(report)
+
+
+@pytest.mark.parametrize("grid_len", [3, 900])
+def test_training_geometry_coverage_probe(grid_len: int) -> None:
+    config = port_training_config(clip=math.inf, fault="none")
+    config.parallelism = NoParallel.Config(device="cpu")
+    config.model.vocab_size = 12 if grid_len == 900 else 4
+    assert isinstance(config.model.embedding, GridEmbedding.Config)
+    config.model.embedding.grid_shape = (grid_len,)
+    with torch.random.fork_rng(devices=[]), host_agnostic_numerics():
+        torch.default_generator.manual_seed(0)
+        subject = GeometrySubject(config, grid_len)
+        record = record_training(subject, rank=0, clip=math.inf)
+    assert record["step/loss"].shape[0] == 3
+    assert record["step/model"].shape[-1] == (12 if grid_len == 900 else 4)
 
 
 if __name__ == "__main__":

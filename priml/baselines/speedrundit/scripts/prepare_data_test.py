@@ -9,6 +9,7 @@ from typing import Final, cast, override
 from configgle import Fig, Makeable
 from PIL import Image
 from torch import Tensor, nn
+from torch.nn import functional
 
 import pytest
 import torch
@@ -24,11 +25,14 @@ from priml.model.vision_ae.latent_norm import ScaleLatents
 
 _CWD: Final = Path(__file__).resolve().parent
 _SIZE: Final = 16
-"""Crop side the fake autoencoder asks for."""
+"""Crop side the fake autoencoder asks for; square because center_crop cuts squares."""
+
+_GRID: Final = (2, 3)
+"""The fake latent's height and width."""
 
 
 class _MeanAutoencoder(nn.Module):
-    """Encodes an image as its per-channel means, repeated to four channels."""
+    """Encodes an image as its pooled channel means, the first repeated as a fourth."""
 
     class Config(Fig["_MeanAutoencoder"]):
         image_size: int = _SIZE
@@ -40,21 +44,22 @@ class _MeanAutoencoder(nn.Module):
         """The identity scale."""
 
         def latent_shape(self) -> tuple[int, int, int]:
-            """Return four channels on a 1x1 grid."""
-            return 4, 1, 1
+            """Return four channels on the fake's grid."""
+            return 4, *_GRID
 
     def __init__(self, config: Config) -> None:
         super().__init__()
         del config
 
     def encode(self, image: Tensor, /) -> Tensor:
-        """Return ``[B, 4, 1, 1]`` channel means."""
-        means = image.float().mean(dim=(2, 3))
-        return torch.cat([means, means[:, :1]], dim=1)[:, :, None, None]
+        """Return ``[B, 4, 2, 3]`` pooled channel means."""
+        means = functional.adaptive_avg_pool2d(image.float(), _GRID)
+        return torch.cat([means, means[:, :1]], dim=1)
 
     def decode(self, latent: Tensor, /) -> Tensor:
-        """Return a flat image of the first three means."""
-        return (latent[:, :3] / 255).expand(-1, -1, _SIZE, _SIZE)
+        """Return a flat image of the first three channels' means."""
+        means = latent[:, :3].mean(dim=(2, 3), keepdim=True)
+        return (means / 255).expand(-1, -1, _SIZE, _SIZE)
 
     @override
     def forward(self, image: Tensor) -> Tensor:
@@ -129,7 +134,7 @@ def test_receipt_records_the_producers_and_error(tmp_path: Path) -> None:
     _ = prepare_data.prepare(config, _imagenet(tmp_path, 2), device="cpu")
     receipt = _receipt(config)
     autoencoder = DictCodec.coerce(receipt["autoencoder"], default=None)
-    assert autoencoder["latent_shape"] == [4, 1, 1]
+    assert autoencoder["latent_shape"] == [4, *_GRID]
     error = DictCodec.coerce(
         DictCodec.coerce(receipt["details"], default=None)["error"],
         default=None,

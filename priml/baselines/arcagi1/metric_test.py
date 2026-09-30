@@ -12,12 +12,25 @@ import numpy as np
 import pytest
 import torch
 
-from priml.baselines.arcagi1.augmentation import ColorDihedral, SpatialAugmentation
+from priml.baselines.arcagi1.augmentation import (
+    ArcSpec,
+    ColorDihedral,
+    SpatialAugmentation,
+)
 from priml.baselines.arcagi1.metric import (
     CanonicalPassK,
     PassK,
     PerOutputPass,
+    SignalDumpPayload,
+    SignalDumpTracker,
     StrictPass,
+    _any_rank,
+    _gather_grids,
+    _gather_list,
+    _hash_bytes,
+    _model_output_header_width,
+    _shape,
+    _uint8_rows,
 )
 
 
@@ -122,22 +135,22 @@ def test_valid_count_truncates_before_voting() -> None:
 def test_votes_accumulate_across_batches() -> None:
     """Views of one puzzle arrive in different batches and must still group."""
     metric = _metric()
-    labels = torch.full((1, 9), 3, dtype=torch.int64)
+    labels = torch.full((2, 9), 3, dtype=torch.int64)
     wrong = labels.clone()
-    wrong[0, 0] = 7
-    identifiers = torch.zeros(1, dtype=torch.int64)
+    wrong[:, 0] = 7
+    identifiers = torch.zeros(2, dtype=torch.int64)
     metric.update(
-        _packed(wrong, torch.zeros(1)),
+        _packed(wrong, torch.zeros(2)),
         label=labels,
         puzzle_identifiers=identifiers,
     )
     metric.update(
-        _packed(wrong, torch.zeros(1)),
+        _packed(wrong, torch.zeros(2)),
         label=labels,
         puzzle_identifiers=identifiers,
     )
     metric.update(
-        _packed(labels.clone(), torch.zeros(1)),
+        _packed(labels.clone(), torch.zeros(2)),
         label=labels,
         puzzle_identifiers=identifiers,
     )
@@ -148,12 +161,12 @@ def test_votes_accumulate_across_batches() -> None:
 def test_grid_is_read_from_the_end() -> None:
     """Diagnostic columns between the halt logit and the grid are ignored."""
     metric = _metric()
-    labels = torch.full((1, 9), 3, dtype=torch.int64)
-    padded = torch.cat([torch.zeros(1, 6), labels.float()], dim=-1)
+    labels = torch.full((2, 9), 3, dtype=torch.int64)
+    padded = torch.cat([torch.zeros(2, 6), labels.float()], dim=-1)
     metric.update(
         padded,
         label=labels,
-        puzzle_identifiers=torch.zeros(1, dtype=torch.int64),
+        puzzle_identifiers=torch.zeros(2, dtype=torch.int64),
     )
     assert metric.compute()["pass@1"] == 1.0
 
@@ -164,11 +177,11 @@ def test_empty_metric_reports_zero() -> None:
 
 def test_state_round_trips() -> None:
     metric = _metric()
-    labels = torch.full((1, 9), 3, dtype=torch.int64)
+    labels = torch.full((2, 9), 3, dtype=torch.int64)
     metric.update(
-        _packed(labels.clone(), torch.zeros(1)),
+        _packed(labels.clone(), torch.zeros(2)),
         label=labels,
-        puzzle_identifiers=torch.zeros(1, dtype=torch.int64),
+        puzzle_identifiers=torch.zeros(2, dtype=torch.int64),
     )
     restored = _metric()
     restored.load_state_dict(metric.state_dict())
@@ -183,8 +196,13 @@ def test_canonical_votes_restore_augmented_views_and_cap_by_confidence(
     answer = np.array([[5]], dtype=np.uint8)
     wrong = np.array([[6]], dtype=np.uint8)
     rng = np.random.default_rng(7)
-    name, transform = ColorDihedral.Config().make().sample("task", rng=rng)
-    pack = SpatialAugmentation.Config(max_grid=3).make()
+    transform_config = ColorDihedral.Config()
+    transform_config.separator = ArcSpec().puzzle_id_separator
+    name, transform = transform_config.make().sample("task", rng=rng)
+    pack_config = SpatialAugmentation.Config(spec=ArcSpec())
+    assert isinstance(pack_config.spec, ArcSpec)
+    pack_config.spec.max_grid = 3
+    pack = pack_config.make()
     original_media, original_answer = pack.pack(
         source,
         answer,
@@ -228,10 +246,12 @@ def test_canonical_votes_restore_augmented_views_and_cap_by_confidence(
     capped.update(_packed(predictions, torch.tensor([-4.0, 4.0])), **batch)
     assert _pass_at(capped.compute()) == {"pass@1": 0.0, "pass@2": 0.0}
 
+    # SpatialAugmentation packs grids into its square max_grid.
     translated_media = np.pad(
         augmented_media.reshape(3, 3)[:2, :2],
         ((1, 0), (1, 0)),
     ).reshape(-1)
+    # SpatialAugmentation packs grids into its square max_grid.
     translated_wrong = np.pad(
         augmented_wrong.reshape(3, 3)[:2, :2],
         ((1, 0), (1, 0)),
@@ -270,7 +290,10 @@ def test_canonical_votes_use_configured_transform_separator(tmp_path: Path) -> N
         "task",
         rng=np.random.default_rng(7),
     )
-    pack = SpatialAugmentation.Config(max_grid=3).make()
+    pack_config = SpatialAugmentation.Config(spec=ArcSpec())
+    assert isinstance(pack_config.spec, ArcSpec)
+    pack_config.spec.max_grid = 3
+    pack = pack_config.make()
     media, prediction = pack.pack(
         transform(source),
         transform(answer),
@@ -303,7 +326,10 @@ def test_canonical_equal_votes_keep_first_view_order(
 ) -> None:
     source = np.array([[2]], dtype=np.uint8)
     answer = np.array([[8]], dtype=np.uint8)
-    pack = SpatialAugmentation.Config(max_grid=2).make()
+    pack_config = SpatialAugmentation.Config(spec=ArcSpec())
+    assert isinstance(pack_config.spec, ArcSpec)
+    pack_config.spec.max_grid = 2
+    pack = pack_config.make()
     media = pack.pack(source, answer, training=False, rng=np.random.default_rng(0))[0]
     predictions = [
         pack.pack(
@@ -337,7 +363,10 @@ def test_canonical_equal_votes_keep_first_view_order(
 # ``[[6]]``. So ``a`` is half solved and ``b`` fully solved.
 def _two_input_tree(tmp_path: Path) -> dict[str, object]:
     """Tasks ``a`` (two test inputs) and ``b`` (one); every view answers ``[[5]]``."""
-    pack = SpatialAugmentation.Config(max_grid=2).make()
+    pack_config = SpatialAugmentation.Config(spec=ArcSpec())
+    assert isinstance(pack_config.spec, ArcSpec)
+    pack_config.spec.max_grid = 2
+    pack = pack_config.make()
     inputs = [
         np.array([[2]], dtype=np.uint8),
         np.array([[3]], dtype=np.uint8),
@@ -435,6 +464,49 @@ def test_canonical_construction_defers_reading_the_tree(tmp_path: Path) -> None:
 def _pass_at(scores: Mapping[str, object]) -> dict[str, object]:
     """Keep only the ``pass@K`` scores; report-only rankings are tested elsewhere."""
     return {key: value for key, value in scores.items() if key.startswith("pass@")}
+
+
+def test_global_prediction_gather(monkeypatch: pytest.MonkeyPatch) -> None:
+    candidate = CanonicalPassK.Config().make()
+    digest = "0" * 64
+    candidate._preds = {"task": {digest: [(digest, 0.5)]}}
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_backend", lambda: "gloo")
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 1)
+
+    def gather(output: list[Tensor], value: Tensor) -> None:
+        output[0].copy_(value)
+
+    monkeypatch.setattr(torch.distributed, "all_gather", gather)
+    assert candidate._global_preds() == candidate._preds
+
+
+def test_signal_tracker_branches(tmp_path: Path) -> None:
+    tracker = SignalDumpTracker.Config(working_dir=tmp_path / "dump.npz").make()
+    tracker.log_metrics({}, 1, prefix="train/")
+    tracker.log_metrics({}, 1, prefix="eval/")
+    with pytest.raises(TypeError, match="expected metrics"):
+        tracker.log_metrics({"extras": 3}, 1, prefix="eval/")
+    payload = SignalDumpPayload(rows=[], grids={}, steps=[], pass_ks=())
+    tracker.log_metrics({"extras": {"signal_dump": payload}}, 2, prefix="eval/")
+    tracker.log_images("x", [], 1)
+    tracker.log_notes("x")
+    tracker.close()
+
+
+def test_metric_private_helpers_and_width_errors() -> None:
+    values = torch.tensor([[0, 257], [3, 4]])
+    assert [row.tolist() for row in _uint8_rows(values)] == [[0, 1], [3, 4]]
+    assert _shape(np.zeros((2, 3), dtype=np.uint8)) == (2, 3)
+    assert _any_rank(True)
+    assert _gather_list([1, 2]) == [1, 2]
+    assert _gather_grids({"x": np.zeros((2, 3), dtype=np.uint8)})["x"].shape == (2, 3)
+    assert _model_output_header_width(out_width=10, media_len=9, k_steps=0) == 1
+    with pytest.raises(ValueError, match="Expected len"):
+        _hash_bytes("bad")
+    with pytest.raises(ValueError, match="expected 1"):
+        _model_output_header_width(out_width=14, media_len=9, k_steps=0)
 
 
 if __name__ == "__main__":

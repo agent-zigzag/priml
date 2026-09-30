@@ -8,11 +8,14 @@ one storage and :func:`put_steps` stacks per-step values under one key.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from pathlib import Path
+from re import Pattern
 from typing import TYPE_CHECKING, Final, cast
 
 import math
 import os
+import re
 import zlib
 
 from torch import Tensor
@@ -23,7 +26,7 @@ from priml.lib.custom_json import DictCodec
 
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Mapping
+    from collections.abc import Generator, Iterable, Mapping
 
     import pytest
 
@@ -184,6 +187,33 @@ def mismatches(
     return report
 
 
+@contextmanager
+def expect_golden_mismatch(match: str | Pattern[str]) -> Generator[None]:
+    """Require a matching golden assertion failure without regeneration.
+
+    Args:
+      match: Regular expression matched against the assertion message.
+
+    Yields:
+      nothing: No value; used as a context manager around a golden assertion.
+
+    """
+    prior = os.environ.pop("BFB_REGENERATE", None)
+    mismatch = False
+    try:
+        try:
+            yield
+        except AssertionError as error:
+            if not re.search(match, str(error)):
+                raise
+            mismatch = True
+    finally:
+        if prior is not None:
+            os.environ["BFB_REGENERATE"] = prior
+    if not mismatch:
+        raise AssertionError("Expected a golden mismatch, but the comparison passed.")
+
+
 def assert_tensor_golden(path: Path, record: Mapping[str, Tensor]) -> None:
     """Require ``record`` to equal the tensor golden at ``path``.
 
@@ -275,49 +305,21 @@ def rng_fingerprint() -> Tensor:
     return torch.randint(0, 2**31 - 1, (8,), generator=generator)
 
 
-# A trained weight is the product of every step before it, so its bits already pin the
-# whole trajectory; a few elements per tensor catch any divergence without storing the
-# model.
-def leading(state: Mapping[str, Tensor], *, count: int = 4) -> dict[str, Tensor]:
-    """Return detached copies of the first ``count`` elements of every tensor."""
-    return {k: v.detach().flatten()[:count].clone() for k, v in state.items()}
-
-
-# Evenly spaced rather than leading: an output's regions come from different code
-# (a prefix, the grid, a padded tail), and the first elements see only one of them.
-def spread(value: Tensor, *, count: int = 128) -> Tensor:
-    """Return ``value`` flattened, or ``count`` evenly spaced samples of it.
-
-    Args:
-      value: A recorded tensor.
-      count: Most elements kept.
-
-    Returns:
-      sample: Every element when there are at most ``count``, else elements
-        ``0, n/count, 2n/count, ...`` of the flattened tensor.
-
-    """
-    flat = value.detach().reshape(-1)
-    if flat.numel() <= count:
-        return flat.clone()
-    index = torch.arange(count, device=flat.device) * flat.numel() // count
-    return flat[index].clone()
-
-
-def heads(tensors: Iterable[Tensor], *, count: int = 4) -> Tensor:
-    """Return the first ``count`` elements of each tensor, joined into one.
+# Every element, never a sample: a check that keeps the first few, or evenly spaced
+# ones, cannot see a regression confined to the elements it dropped.
+def joined(tensors: Iterable[Tensor]) -> Tensor:
+    """Return every element of each tensor, flattened and joined into one.
 
     One key instead of one per tensor keeps a golden's index short.
 
     Args:
       tensors: Tensors in a fixed order.
-      count: Elements kept from each.
 
     Returns:
-      joined: The kept elements in order, under ``torch.cat`` type promotion.
-        Floats widen exactly; an integer joined with a float is converted,
-        which is lossy past the float's mantissa, so join like dtypes.
+      joined: A detached copy of every element in order, under ``torch.cat``
+        type promotion. Floats widen exactly; an integer joined with a float is
+        converted, which is lossy past the float's mantissa, so join like dtypes.
 
     """
-    parts = [t.detach().flatten()[:count] for t in tensors]
+    parts = [t.detach().reshape(-1) for t in tensors]
     return torch.cat(parts) if parts else torch.zeros(0)

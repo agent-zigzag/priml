@@ -40,7 +40,7 @@ Exactly these things are supplied or changed on the reference side:
   the reference's evaluation autocasts on CUDA.
 
 INVAE has no checked-in reference golden: REG hardcodes 32 GroupNorm groups,
-so the smallest model it builds is far over the 28,000-byte golden ceiling.
+so the smallest model it builds is far over the 32,768-byte golden ceiling.
 This run is its reference proof; ``testdata/invae.pt`` guards the port.
 
 Examples:

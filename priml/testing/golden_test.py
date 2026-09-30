@@ -2,34 +2,32 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING
 
 import zlib
 
 import pytest
 import torch
 
+from priml.testing import golden
 from priml.testing.golden import (
     assert_tensor_golden,
     assert_text_golden,
-    heads,
-    leading,
+    expect_golden_mismatch,
+    joined,
     mismatches,
     put_steps,
     read_tensors,
     rng_fingerprint,
-    spread,
     stored,
     write_tensors,
 )
 
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from torch import Tensor
-
-
-_CWD: Final = Path(__file__).resolve().parent
 
 
 def test_assert_text_golden_reads_testdata(
@@ -220,42 +218,31 @@ def test_rng_fingerprint_does_not_advance_the_generator() -> None:
         assert not torch.equal(first, rng_fingerprint())
 
 
-def test_leading_keeps_the_first_elements_of_each_tensor() -> None:
-    state = {"w": torch.arange(12.0).view(3, 4), "b": torch.arange(2.0)}
-    heads = leading(state, count=4)
-    assert torch.equal(heads["w"], torch.arange(4.0))
-    assert torch.equal(heads["b"], torch.arange(2.0))
-    heads["w"][0] = 99.0
-    assert state["w"][0, 0] == 0.0
-
-
-def test_spread_keeps_small_tensors_whole() -> None:
-    value = torch.arange(6.0).view(2, 3)
-    assert torch.equal(spread(value, count=8), value.flatten())
-
-
-def test_spread_samples_evenly_across_a_large_tensor() -> None:
-    assert spread(torch.arange(100), count=4).tolist() == [0, 25, 50, 75]
-
-
-def test_spread_samples_the_last_stride_of_a_tensor() -> None:
-    """The final sample lands within one stride of the end, not near the start."""
-    sample = spread(torch.arange(1000), count=128)
-    assert int(sample[-1]) == 127 * 1000 // 128
-
-
-def test_heads_joins_leading_elements_and_widens_exactly() -> None:
-    joined = heads(
+def test_joined_keeps_every_element_in_order_and_widens_exactly() -> None:
+    """A golden compares whole tensors; joining one keeps its last element too."""
+    first = torch.arange(6.0).view(2, 3)
+    value = joined(
         [
-            torch.arange(6.0).view(2, 3),
+            first,
             torch.tensor([0.5], dtype=torch.bfloat16),
             torch.tensor([1.25, 2.0, 3.0, 4.0, 5.0], dtype=torch.float64),
         ],
-        count=4,
     )
-    assert joined.dtype == torch.float64
-    expected = [0.0, 1.0, 2.0, 3.0, 0.5, 1.25, 2.0, 3.0, 4.0]
-    assert joined.tolist() == expected
+    assert value.dtype == torch.float64
+    expected = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 0.5, 1.25, 2.0, 3.0, 4.0, 5.0]
+    assert value.tolist() == expected
+    value[0] = 99.0
+    assert first[0, 0] == 0.0
+
+
+def test_joined_detaches_and_accepts_no_tensors() -> None:
+    assert not joined([torch.ones(2, 3, requires_grad=True)]).requires_grad
+    assert joined([]).numel() == 0
+
+
+def test_golden_offers_no_truncating_helper() -> None:
+    """Sampling a compared tensor hides the elements it drops from the check."""
+    assert not {"leading", "spread", "heads"} & set(vars(golden))
 
 
 def test_mismatches_sees_presence_dtype_shape_and_bits() -> None:
@@ -289,17 +276,41 @@ def test_assert_tensor_golden_mints_missing_then_compares(
     assert torch.equal(read_tensors(path)["d"], changed["d"])
 
 
-def test_every_priml_golden_is_at_most_28_000_bytes() -> None:
-    """A golden pins a code path, so it stores only what its check needs."""
-    root = _CWD.parent
-    goldens = sorted(root.rglob("*.pt"))
-    assert goldens, "no goldens found; the glob no longer matches the layout"
-    large = [
-        f"{path.relative_to(root)}: {path.stat().st_size}"
-        for path in goldens
-        if path.stat().st_size > 28_000
-    ]
-    assert not large, "goldens over 28,000 bytes:\n" + "\n".join(large)
+def test_expect_golden_mismatch_blocks_regeneration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "testdata" / "g.pt"
+    original = _record()
+    changed = {**original, "d": torch.tensor(2.5, dtype=torch.float64)}
+    monkeypatch.delenv("BFB_REGENERATE", raising=False)
+    with pytest.raises(AssertionError, match="Missing golden minted"):
+        assert_tensor_golden(path, original)
+    before = path.read_bytes()
+
+    monkeypatch.setenv("BFB_REGENERATE", "1")
+    assert_tensor_golden(path, changed)
+    assert path.read_bytes() != before
+
+    write_tensors(path, original)
+    before = path.read_bytes()
+    with expect_golden_mismatch(match=r"1 mismatches"):
+        assert_tensor_golden(path, changed)
+    assert path.read_bytes() == before
+
+
+def test_expect_golden_mismatch_requires_the_message_to_match(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "testdata" / "g.pt"
+    record = _record()
+    with pytest.raises(AssertionError, match="Missing golden minted"):
+        assert_tensor_golden(path, record)
+    with (
+        pytest.raises(AssertionError, match="different failure"),
+        expect_golden_mismatch(match=r"1 mismatches"),
+    ):
+        raise AssertionError("different failure")
 
 
 if __name__ == "__main__":

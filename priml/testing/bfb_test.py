@@ -35,6 +35,7 @@ from priml.model.transformer.block import TransformerBlock
 from priml.testing.bfb import (
     _ENV_REGENERATE,
     _EXACT_F32_OPS,
+    _RANDOM_FACTORIES,
     _assert_equal,
     _assert_portable_output_dtype,
     _downcast_f64,
@@ -47,6 +48,7 @@ from priml.testing.bfb import (
     _write_back,
     assert_bfb_against_golden,
     bfb_devices,
+    changed_state,
     first_tensor,
     host_agnostic_numerics,
     load_golden,
@@ -54,9 +56,10 @@ from priml.testing.bfb import (
     portable_half_precision,
     randomize_parameters,
     regenerate_golden,
-    state_differs,
-    state_digest,
+    save_golden,
+    stale_post_states,
 )
+from priml.testing.golden import expect_golden_mismatch
 
 
 _THIS: Final = Path(__file__).resolve()
@@ -247,8 +250,8 @@ class _WideMutated(nn.Module):
         return input * self.weight.sum()
 
 
-def test_post_run_state_costs_a_digest_not_a_copy(tmp_path: Path) -> None:
-    """Widening a mutated tensor grows the golden by its pre-run copy alone."""
+def test_post_run_state_is_stored_whole(tmp_path: Path) -> None:
+    """A mutated tensor is stored twice: its pre-run copy and its post-run value."""
     sizes: list[int] = []
     for width in (4, 4_004):
         name = f"wide{width}"
@@ -267,7 +270,7 @@ def test_post_run_state_costs_a_digest_not_a_copy(tmp_path: Path) -> None:
         sizes.append((tmp_path / f"{name}.pt").stat().st_size)
     growth = sizes[1] - sizes[0]
     one_copy = 4_000 * 4
-    assert one_copy <= growth < one_copy + 512
+    assert 2 * one_copy <= growth < 2 * one_copy + 512
 
 
 class _WideOutput(nn.Module):
@@ -283,22 +286,20 @@ class _WideOutput(nn.Module):
         return torch.arange(self.width, dtype=torch.float32) * self.scale * input.sum()
 
 
-def test_output_costs_a_digest_not_a_copy(tmp_path: Path) -> None:
-    """Widening the output leaves the golden's size unchanged."""
-    sizes: list[int] = []
-    for width in (4, 4_004):
-        name = f"out{width}"
-        regenerate_golden(
-            golden_dir=tmp_path,
-            golden_name=name,
-            build_module=partial(_WideOutput, width),
-            build_input=_build_min_input,
-        )
-        sizes.append((tmp_path / f"{name}.pt").stat().st_size)
-    assert sizes[1] - sizes[0] < 512
+def test_output_is_stored_whole(tmp_path: Path) -> None:
+    """The stored output is the run's output, readable without rerunning."""
+    regenerate_golden(
+        golden_dir=tmp_path,
+        golden_name="out",
+        build_module=partial(_WideOutput, 64),
+        build_input=_build_min_input,
+    )
+    output = load_golden(tmp_path / "out.pt")["output"]
+    assert output.shape == (64,)
+    assert torch.equal(output[:2], torch.tensor([0.0, 1.0]) * output[1])
 
 
-def test_output_drift_past_the_heads_is_caught(tmp_path: Path) -> None:
+def test_output_drift_reports_ulps(tmp_path: Path) -> None:
     regenerate_golden(
         golden_dir=tmp_path,
         golden_name="out",
@@ -311,7 +312,7 @@ def test_output_drift_past_the_heads_is_caught(tmp_path: Path) -> None:
         assert isinstance(output, Tensor)
         return output.index_fill(0, torch.tensor([63]), 0.5)
 
-    with pytest.raises(AssertionError, match="output"):
+    with pytest.raises(AssertionError, match=r"output: .*max_ulp_diff=\d+"):
         assert_bfb_against_golden(
             golden_dir=tmp_path,
             golden_name="out",
@@ -321,16 +322,12 @@ def test_output_drift_past_the_heads_is_caught(tmp_path: Path) -> None:
         )
 
 
-def test_state_digest_sees_dtype_and_shape() -> None:
-    value = torch.zeros(4)
-    assert state_digest(value).dtype == torch.uint8
-    assert torch.equal(state_digest(value), state_digest(value.clone()))
-    assert not torch.equal(state_digest(value), state_digest(value.view(2, 2)))
-    assert not torch.equal(
-        state_digest(value),
-        state_digest(torch.zeros(2, dtype=torch.float64)),
-    )
-    assert not torch.equal(state_digest(value), state_digest(-value))
+def test_changed_state_keeps_new_and_bitwise_changed_entries() -> None:
+    value = torch.zeros(2)
+    assert set(changed_state({"a": value}, {"a": value, "b": value})) == {"b"}
+    assert set(changed_state({"a": value}, {"a": torch.zeros(3)})) == {"a"}
+    assert set(changed_state({"a": value}, {"a": -value})) == {"a"}
+    assert not changed_state({"a": value}, {"a": value.clone()})
 
 
 def test_missing_golden_always_fails_after_minting(tmp_path: Path) -> None:
@@ -405,14 +402,6 @@ def test_to_cpu_clones_tensors_and_recurses_into_containers() -> None:
     assert _to_cpu(None) is None
 
 
-def test_state_differs_on_a_key_or_shape_change() -> None:
-    value = torch.zeros(2)
-    assert state_differs({"a": value}, {"a": value, "b": value})
-    assert state_differs({"a": value}, {"a": torch.zeros(3)})
-    assert state_differs({"a": value}, {"a": torch.zeros(2, dtype=torch.float64)})
-    assert not state_differs({"a": value}, {"a": value.clone()})
-
-
 class _OtherDevice(Tensor):
     """A CPU tensor reporting a different device, to reach the cross-device path."""
 
@@ -424,7 +413,7 @@ def test_equality_checks_compare_across_devices_on_cpu() -> None:
     local = torch.tensor([1.0, 2.0])
     assert elsewhere.device != local.device
     _assert_equal(elsewhere, local, label="output")
-    assert not state_differs({"a": elsewhere}, {"a": local})
+    assert not changed_state({"a": elsewhere}, {"a": local})
 
 
 def test_assert_equal_reports_non_tensor_shape_and_dtype_mismatches() -> None:
@@ -627,7 +616,7 @@ def test_explicit_regeneration_of_an_existing_golden_returns_normally(
     )
 
     # The archive's internal name changes with the temp file; the payload does not.
-    assert not state_differs(_loaded_golden(path)["state_dict"], before)
+    assert not changed_state(before, _loaded_golden(path)["state_dict"])
 
 
 def test_default_runner_splats_a_tuple_input_and_requires_a_tensor(
@@ -636,7 +625,7 @@ def test_default_runner_splats_a_tuple_input_and_requires_a_tensor(
     class TwoArgModule(nn.Module):
         def __init__(self) -> None:
             super().__init__()
-            self.lin = nn.Linear(3, 2)
+            self.lin = nn.Linear(3, 4)
 
         @override
         def forward(self, a: Tensor, b: Tensor) -> Tensor:
@@ -645,7 +634,7 @@ def test_default_runner_splats_a_tuple_input_and_requires_a_tensor(
     def build_input() -> tuple[Tensor, Tensor]:
         return (
             torch.linspace(-1.0, 1.0, 6).reshape(2, 3),
-            torch.linspace(0.0, 1.0, 4).reshape(2, 2),
+            torch.linspace(0.0, 1.0, 8).reshape(2, 4),
         )
 
     regenerate_golden(
@@ -790,6 +779,73 @@ def test_bfb_detects_forward_drift(tmp_path: Path) -> None:
         )
 
 
+def test_bfb_detects_a_changed_input(tmp_path: Path) -> None:
+    """A test whose input moved on no longer matches the golden it replays."""
+    regenerate_golden(
+        golden_dir=tmp_path,
+        golden_name="linear_input",
+        build_module=_build_min_linear,
+        build_input=_build_min_input,
+        seed=0,
+    )
+
+    with pytest.raises(AssertionError, match="input"):
+        assert_bfb_against_golden(
+            golden_dir=tmp_path,
+            golden_name="linear_input",
+            build_module=_build_min_linear,
+            build_input=lambda: torch.randn(3, 4),
+            seed=0,
+        )
+
+
+def test_expect_golden_mismatch_blocks_bfb_regeneration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    regenerate_golden(
+        golden_dir=tmp_path,
+        golden_name="linear_min",
+        build_module=_build_min_linear,
+        build_input=_build_min_input,
+        seed=0,
+    )
+
+    class _DriftLinear(nn.Linear):
+        @override
+        def forward(self, input: Tensor) -> Tensor:
+            return super().forward(input) + 1e-3
+
+    monkeypatch.setenv(_ENV_REGENERATE, "1")
+    before = (tmp_path / "linear_min.pt").read_bytes()
+    assert_bfb_against_golden(
+        golden_dir=tmp_path,
+        golden_name="linear_min",
+        build_module=lambda: _DriftLinear(4, 3, bias=True),
+        build_input=_build_min_input,
+        seed=0,
+    )
+    assert (tmp_path / "linear_min.pt").read_bytes() != before
+
+    regenerate_golden(
+        golden_dir=tmp_path,
+        golden_name="linear_min",
+        build_module=_build_min_linear,
+        build_input=_build_min_input,
+        seed=0,
+    )
+    before = (tmp_path / "linear_min.pt").read_bytes()
+    with expect_golden_mismatch(match=r"output"):
+        assert_bfb_against_golden(
+            golden_dir=tmp_path,
+            golden_name="linear_min",
+            build_module=lambda: _DriftLinear(4, 3, bias=True),
+            build_input=_build_min_input,
+            seed=0,
+        )
+    assert (tmp_path / "linear_min.pt").read_bytes() == before
+
+
 def test_bfb_detects_state_dict_key_drift(tmp_path: Path) -> None:
     regenerate_golden(
         golden_dir=tmp_path,
@@ -845,7 +901,7 @@ def test_dict_input_dispatches_via_kwargs(tmp_path: Path) -> None:
     class TwoArgModule(nn.Module):
         def __init__(self) -> None:
             super().__init__()
-            self.lin = nn.Linear(3, 2)
+            self.lin = nn.Linear(3, 4)
 
         @override
         def forward(self, a: Tensor, b: Tensor) -> Tensor:
@@ -857,7 +913,7 @@ def test_dict_input_dispatches_via_kwargs(tmp_path: Path) -> None:
     def build_input() -> dict[str, Tensor]:
         return {
             "a": torch.linspace(-1.0, 1.0, 6).reshape(2, 3),
-            "b": torch.linspace(0.0, 1.0, 4).reshape(2, 2),
+            "b": torch.linspace(0.0, 1.0, 8).reshape(2, 4),
         }
 
     regenerate_golden(
@@ -913,11 +969,7 @@ def test_param_mutating_runner_captures_post_state(tmp_path: Path) -> None:
 
 
 def test_no_checked_in_golden_stores_an_unchanged_post_state() -> None:
-    """A golden whose run mutated nothing must not carry a post-run state.
-
-    ``_write_golden`` omits it when the state is unchanged and
-    ``_replay_golden`` reads an absent one as "equal to ``state_dict``", so a
-    stored record of the pre-state asserts exactly what no key asserts.
+    """Every priml golden's post-run state holds only tensors the run changed.
 
     Gated rather than trusted because the omission arrived as a WRITER change
     with no migration: nineteen goldens minted before it kept the copy, the
@@ -927,19 +979,27 @@ def test_no_checked_in_golden_stores_an_unchanged_post_state() -> None:
     """
     goldens = sorted(_CWD.parent.rglob("*.pt"))
     assert goldens, "no goldens found; the glob no longer matches the layout"
-    stale: list[Path] = []
-    for path in goldens:
-        payload = _loaded_golden(path)
-        post = payload.get("post_state_digest")
-        if post is None:
-            continue
-        pre = {key: state_digest(value) for key, value in payload["state_dict"].items()}
-        if not state_differs(pre, post):
-            stale.append(path)
-    assert not stale, (
-        f"{len(stale)} golden(s) store a post-state equal to their pre-state: "
-        f"{[str(p) for p in stale]}"
+    stale = stale_post_states(goldens)
+    assert not stale, f"goldens storing an unchanged post-state: {stale}"
+
+
+def test_stale_post_states_reports_then_clears_a_synthetic_golden(
+    tmp_path: Path,
+) -> None:
+    regenerate_golden(
+        golden_dir=tmp_path,
+        golden_name="buffer_mutating",
+        build_module=_BufferMutatingModule,
+        build_input=_build_min_input,
     )
+    path = tmp_path / "buffer_mutating.pt"
+    assert stale_post_states([path]) == []
+    payload = load_golden(path)
+    post = payload.get("post_state")
+    assert post is not None
+    payload["post_state"] = {**post, "lin.bias": payload["state_dict"]["lin.bias"]}
+    save_golden(path, payload)
+    assert stale_post_states([path]) == [path]
 
 
 # Only the state entries are returned: a golden also holds an input, an output digest,
@@ -955,10 +1015,8 @@ def _loaded_golden(path: Path) -> dict[str, dict[str, Tensor]]:
         return {}
     payload = load_golden(path)
     states = {"state_dict": payload["state_dict"]}
-    if "post_state_digest" in payload:
-        states["post_state_digest"] = payload["post_state_digest"]
-    if "post_state_heads" in payload:
-        states["post_state_heads"] = payload["post_state_heads"]
+    if "post_state" in payload:
+        states["post_state"] = payload["post_state"]
     return states
 
 
@@ -1054,7 +1112,7 @@ def test_bfb_captures_forward_buffer_mutation(tmp_path: Path) -> None:
     )
     payload = _loaded_golden(tmp_path / "buffer_mutating.pt")
     pre = payload["state_dict"]["running_sum"]
-    post = payload["post_state_heads"]["running_sum"]
+    post = payload["post_state"]["running_sum"]
     assert torch.equal(pre, torch.zeros(3))
     assert not torch.equal(post, torch.zeros(3))
 
@@ -1186,7 +1244,7 @@ def _f32_equals_f64_downcast(op: TensorFn) -> bool:
 # rounding is under test). Pure data-movement ops (views, reshapes, gathers)
 # carry no arithmetic and so are trivially host-independent; only ops that
 # compute a value need proving here.
-_EXACT_ARITHMETIC_PROBES: dict[str, TensorFn] = {
+_EXACT_ARITHMETIC_PROBES: Final[dict[str, TensorFn]] = {
     "add": lambda a: a + a,
     "sub": lambda a: a - a.flip(0),
     "mul": lambda a: a * a,
@@ -1221,7 +1279,7 @@ def test_exact_f32_ops_are_host_independent(name: str) -> None:
 # Declared non-arithmetic ops that touch float32 data, each with a single-op
 # probe using a FIXED index/operand so the f32 and f64 calls are identical. Used
 # to prove the "host-independent by construction" claim rather than trust it.
-_NONARITHMETIC_PROBES: dict[str, TensorFn] = {
+_NONARITHMETIC_PROBES: Final[dict[str, TensorFn]] = {
     "gather": lambda a: a.gather(0, torch.arange(0, a.numel(), 7) % a.numel()),
     "index_select": lambda a: a.index_select(0, torch.arange(0, 50)),
     "masked_fill": lambda a: a.masked_fill(a > 0, 0.123),
@@ -1247,7 +1305,7 @@ _NONARITHMETIC_PROBES: dict[str, TensorFn] = {
 # require an ``arith`` probe, so each must appear in ``_NONARITHMETIC_PROBES``
 # explicitly -- ``test_value_producing_nonarith_ops_are_probed`` enforces this so
 # a future value op mistagged ``movement`` cannot dodge proof.
-_VALUE_PRODUCING_NONARITH = frozenset(
+_VALUE_PRODUCING_NONARITH: Final = frozenset(
     {"where", "copy_", "_to_copy", "to", "fill_", "masked_fill", "masked_fill_"},
 )
 
@@ -1324,7 +1382,7 @@ def test_every_allowlist_entry_is_categorized_and_arith_is_probed() -> None:
 # Allocation ops return uninitialized memory, so any equality probe is
 # meaningless (two calls differ). Excluded from the enumeration scan -- they are
 # pure allocation, carry no value to diverge, and are host-independent by nature.
-_ALLOCATION_OPS = frozenset(
+_ALLOCATION_OPS: Final = frozenset(
     {"empty", "empty_like", "empty_strided", "new_empty", "new_empty_strided"},
 )
 
@@ -1398,8 +1456,15 @@ def test_no_allowlisted_op_is_width_divergent() -> None:
 # still seeing a float32 argument here ran native float32 without being upcast -- a
 # cross-host-divergence leak (the failure mode the flash-attention kernel exhibited
 # before the SDPA-math pin).
-def _f32_leaking_ops(run: Callable[[], object]) -> set[str]:
-    """Names of non-allowlisted ops that still receive float32 under the harness."""
+# A tensorless sampler (``randn``) has no float32 argument to see, so it is caught by
+# its float32 result instead. ``wrap=False`` traces a call that is responsible for
+# entering ``host_agnostic_numerics`` itself.
+def _f32_leaking_ops(
+    run: Callable[[], object],
+    *,
+    wrap: bool = True,
+) -> set[str]:
+    """Names of non-allowlisted ops that still compute in float32 under the harness."""
     leaks: set[str] = set()
 
     def has_f32(value: object) -> bool:
@@ -1422,12 +1487,20 @@ def _f32_leaking_ops(run: Callable[[], object]) -> set[str]:
         ) -> object:
             name = _op_name(func)
             values = (*args, *(kwargs or {}).values())
-            if name not in _EXACT_F32_OPS and any(has_f32(value) for value in values):
+            result = func(*args, **(kwargs or {}))
+            if name not in _EXACT_F32_OPS and (
+                any(has_f32(value) for value in values)
+                or (name in _RANDOM_FACTORIES and has_f32(result))
+            ):
                 leaks.add(name)
-            return func(*args, **(kwargs or {}))
+            return result
 
-    with _Trace(), host_agnostic_numerics():
-        run()
+    with _Trace():
+        if wrap:
+            with host_agnostic_numerics():
+                run()
+        else:
+            run()
     return leaks
 
 
@@ -1462,16 +1535,56 @@ def test_no_unvetted_f32_op_in_transformer_forward_backward() -> None:
     )
 
 
-def _add_in_place(m: Tensor, x: Tensor) -> Tensor:
-    return m.clone().add_(x, alpha=0.1)
+class _DrawsAtConstruction(nn.Module):
+    """Initializes, fills an unsaved buffer, and draws, all while being built.
+
+    Replay rebuilds the unsaved buffer instead of loading it, and the module's
+    initializer consumes the generator ``build_input`` draws from next, so both
+    reach the golden. A float32 ``randn`` of 16+ elements and a ``sin`` each
+    land on vector-ISA-specific bits unless computed host-agnostically.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.lin = nn.Linear(4, 3)
+        self.register_buffer(
+            "phase",
+            torch.randn(18)[:3].sin(),
+            persistent=False,
+        )
+
+    @override
+    def forward(self, input: Tensor) -> Tensor:
+        return self.lin(input) + cast(Tensor, self.phase)
 
 
-def _add(m: Tensor, x: Tensor) -> Tensor:
-    return torch.add(m, x, alpha=0.1)
+def test_the_harness_computes_nothing_natively_in_float32(tmp_path: Path) -> None:
+    """Building, input, randomization, and the run are all host-agnostic.
 
+    A golden is portable only if EVERY value it stores or replays was computed
+    under ``host_agnostic_numerics``. Wrapping the run alone left the module's
+    construction, its unsaved buffers, the parameter randomization, and the
+    input outside it, so a golden minted natively failed replay under
+    ``ATEN_CPU_CAPABILITY=default``.
+    """
 
-def _sub(m: Tensor, x: Tensor) -> Tensor:
-    return torch.sub(m, x, alpha=0.1)
+    def check() -> None:
+        with pytest.raises(AssertionError, match="Missing golden regenerated"):
+            assert_bfb_against_golden(
+                golden_dir=tmp_path,
+                golden_name="draws",
+                build_module=_DrawsAtConstruction,
+                build_input=lambda: torch.randn(2, 4),
+            )
+        assert_bfb_against_golden(
+            golden_dir=tmp_path,
+            golden_name="draws",
+            build_module=_DrawsAtConstruction,
+            build_input=lambda: torch.randn(2, 4),
+        )
+
+    leaks = _f32_leaking_ops(check, wrap=False)
+    assert not leaks, f"ran natively in float32 outside the harness: {sorted(leaks)}"
 
 
 def _fused_operands() -> tuple[Tensor, Tensor, Tensor]:
@@ -1482,30 +1595,30 @@ def _fused_operands() -> tuple[Tensor, Tensor, Tensor]:
     return m, x, x.abs() + 0.5
 
 
-def _lerp(m: Tensor, x: Tensor, d: Tensor) -> Tensor:
+def lerp_fused(m: Tensor, x: Tensor, d: Tensor) -> Tensor:
     del d
     return m.lerp(x, 0.9)
 
 
-def _lerp_unfused(m: Tensor, x: Tensor, d: Tensor) -> Tensor:
+def lerp_unfused(m: Tensor, x: Tensor, d: Tensor) -> Tensor:
     del d
     return (0.9 - 1) * (x - m) + x
 
 
-def _addcdiv(m: Tensor, x: Tensor, d: Tensor) -> Tensor:
+def addcdiv_fused(m: Tensor, x: Tensor, d: Tensor) -> Tensor:
     return m.addcdiv(x, d, value=-0.01)
 
 
-def _addcdiv_unfused(m: Tensor, x: Tensor, d: Tensor) -> Tensor:
+def addcdiv_unfused(m: Tensor, x: Tensor, d: Tensor) -> Tensor:
     return m + -0.01 * x / d
 
 
-def _addcmul(m: Tensor, x: Tensor, d: Tensor) -> Tensor:
+def addcmul_fused(m: Tensor, x: Tensor, d: Tensor) -> Tensor:
     del d
     return m.addcmul(x, x, value=0.01)
 
 
-def _addcmul_unfused(m: Tensor, x: Tensor, d: Tensor) -> Tensor:
+def addcmul_unfused(m: Tensor, x: Tensor, d: Tensor) -> Tensor:
     del d
     return m + 0.01 * x * x
 
@@ -1513,9 +1626,9 @@ def _addcmul_unfused(m: Tensor, x: Tensor, d: Tensor) -> Tensor:
 @pytest.mark.parametrize(
     ("fused", "unfused"),
     [
-        (_lerp, _lerp_unfused),
-        (_addcdiv, _addcdiv_unfused),
-        (_addcmul, _addcmul_unfused),
+        (lerp_fused, lerp_unfused),
+        (addcdiv_fused, addcdiv_unfused),
+        (addcmul_fused, addcmul_unfused),
     ],
 )
 def test_fused_multiply_add_rounds_like_separate_ops(
@@ -1573,8 +1686,26 @@ def test_softmax_backward_rounds_like_separate_ops(
     assert torch.equal(got, want.float())
 
 
-@pytest.mark.parametrize("op", [_add_in_place, _add, _sub])
-def test_scaled_add_is_upcast(op: Callable[[Tensor, Tensor], Tensor]) -> None:
+def add_in_place(m: Tensor, x: Tensor) -> Tensor:
+    return m.clone().add_(x, alpha=0.1)
+
+
+def add_scaled(m: Tensor, x: Tensor) -> Tensor:
+    return torch.add(m, x, alpha=0.1)
+
+
+def sub_scaled(m: Tensor, x: Tensor) -> Tensor:
+    return torch.sub(m, x, alpha=0.1)
+
+
+@pytest.mark.parametrize(
+    ("op", "sign"),
+    [(add_in_place, 1), (add_scaled, 1), (sub_scaled, -1)],
+)
+def test_scaled_add_is_upcast(
+    op: Callable[[Tensor, Tensor], Tensor],
+    sign: int,
+) -> None:
     """``add``/``sub`` with ``alpha`` round once in float64, not in a fused kernel.
 
     Vectorized CPU kernels fuse ``a + alpha * b`` into one FMA rounding and the
@@ -1584,7 +1715,6 @@ def test_scaled_add_is_upcast(op: Callable[[Tensor, Tensor], Tensor]) -> None:
     m, x, _ = _fused_operands()
     with host_agnostic_numerics():
         got = op(m, x)
-    sign = -1 if op is _sub else 1
     assert torch.equal(got, (m.double() + sign * (0.1 * x.double())).float())
 
 
@@ -1647,17 +1777,17 @@ def test_known_host_dependent_ops_are_not_allowlisted() -> None:
     assert not torch.equal(acc32, acc64)
 
 
-def _draw_randn(dtype: torch.dtype | None = None) -> Tensor:
+def draw_randn(dtype: torch.dtype | None = None) -> Tensor:
     return torch.randn(18, dtype=dtype)
 
 
-def _draw_normal(dtype: torch.dtype | None = None) -> Tensor:
+def draw_normal(dtype: torch.dtype | None = None) -> Tensor:
     return torch.normal(0.5, std=2.0, size=(18,), dtype=dtype)
 
 
 @pytest.mark.parametrize(
     "sample",
-    [pytest.param(_draw_randn, id="randn"), pytest.param(_draw_normal, id="normal")],
+    [pytest.param(draw_randn, id="randn"), pytest.param(draw_normal, id="normal")],
 )
 def test_host_agnostic_draws_normal_factories_in_float64(
     sample: Callable[[torch.dtype | None], Tensor],
@@ -2114,7 +2244,7 @@ def test_bfb_compares_float_bits_not_value_equality() -> None:
     with pytest.raises(AssertionError):
         _assert_equal(positive_zero, negative_zero, label="output")
     _assert_equal(nan, nan.clone(), label="output")
-    assert not state_differs({"value": nan}, {"value": nan.clone()})
+    assert not changed_state({"value": nan}, {"value": nan.clone()})
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float64])

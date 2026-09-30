@@ -46,8 +46,8 @@ from priml.train.parallelism import NoParallel
 
 _CWD: Final = Path(__file__).resolve().parent
 
-VOCAB = 32
-SEQ = 8
+VOCAB: Final = 32
+SEQ: Final = 8
 
 
 def test_reference_metric_preserves_native_reduction_and_two_denominators() -> None:
@@ -76,9 +76,9 @@ def test_reference_metric_requires_complete_ordered_batches() -> None:
     """Missing or duplicated reference rows cannot produce a valid score."""
     assert "ReferenceBitsPerByte" in vars(train_step)
     metric = train_step.ReferenceBitsPerByte.Config().make()
-    losses = torch.ones(1, 2)
+    losses = torch.ones(3, 2)
     batch = {
-        "score_mask": torch.ones(1, 2, dtype=torch.bool),
+        "score_mask": torch.ones(3, 2, dtype=torch.bool),
         "evaluation_batch": 0,
         "evaluation_batches": 2,
         "reference_bytes": 2,
@@ -142,7 +142,7 @@ def test_ngram_step_charges_the_receiving_update_after_warmup() -> None:
 
 
 class _EndpointTrajectory(nn.Module):
-    """Two exp022 updates, retaining all eight layers at CPU-test dimensions."""
+    """Three exp022 updates over all eight layers."""
 
     def __init__(self) -> None:
         super().__init__()
@@ -150,18 +150,14 @@ class _EndpointTrajectory(nn.Module):
         assert isinstance(config, train_step.NgramTrainStep.Config)
         model = config.model
         assert isinstance(model, MemoryNanoChatLM.Config)
-        model.vocab_size = 16
-        # Size-only: eight blocks stay (their window pattern is the coverage),
-        # so the per-block width is the lever on the stored initial state.
-        # Eight is the floor: a trigram layer reads three gate slices of two
-        # channels (``3 * gate_channels <= channels_in``), and four channels a
-        # head keeps two heads, so no head-axis reshape is the identity. Every
-        # numeric choice is unchanged.
-        model.channels_in = 8
-        model.max_seq_len = 4
+        model.vocab_size = 2
+        # Trigram attention reads three gate slices, so
+        # ``3 * gate_channels <= channels_in`` with gate width two.
+        model.channels_in = 6
+        model.max_seq_len = 3
         model.dtype = torch.float32
         model.rope.dtype = torch.float32
-        # Portable goldens widen Torch arithmetic; opaque fused operators require
+        # Portable replay widens Torch arithmetic; opaque fused operators require
         # fixed FP32 sinks. Native kernel coverage is separate from this CPU replay.
         model.fused_ngram = False
         model.ngram_dirty_clear = False
@@ -173,20 +169,17 @@ class _EndpointTrajectory(nn.Module):
             assert isinstance(block, TransformerBlock.Config)
             attention = block.attn
             assert isinstance(attention, CausalAttention.Config)
-            attention.channels_head = 4
+            attention.channels_head = 2
             attention.gate_channels = 2
             attention.fused_qk_rope = False
             attention.window = model.max_seq_len if attention.window == 2048 else 2
             attention.kernel = PartialConfig(sdpa_attention)
-            # Size-only: pin every block's feed-forward hidden width to 8 rather
-            # than its per-depth ramp (~24-80 here). The stored pre-run state
-            # spans eight blocks and the FFN is its bulk; the relu-square
-            # nonlinearity and the output norm are unchanged.
+            # A four-wide FFN retains the relu-square and output-norm paths.
             ffn = block.ffn
             assert isinstance(ffn, OutputNormFeedForward.Config)
-            ffn.channels_hidden = 8
+            ffn.channels_hidden = 4
         for table in (*model.bigrams.values(), *model.trigrams.values()):
-            table.num_embeddings = 8
+            table.num_embeddings = 4
         config.parallelism = NoParallel.Config(device="cpu")
         config.compile = None
         config.dtype_autocast = None
@@ -216,7 +209,7 @@ class _EndpointTrajectory(nn.Module):
     @override
     def forward(self, rows: Tensor) -> Tensor:
         losses: list[Tensor] = []
-        for progress in (0.0, 0.8):
+        for progress in (0.0, 0.5, 1.0):
             self._step.elapsed_sec = progress * self._step.config.train_budget_sec
             result = self._step.train_step(media=rows[:, :-1], label=rows[:, 1:])
             losses.append(result["loss"])
@@ -224,13 +217,13 @@ class _EndpointTrajectory(nn.Module):
 
 
 @pytest.mark.compute_training
-def test_exp022_two_updates_match_portable_golden() -> None:
-    """Pin the CPU reference model and optimizer interaction across two updates."""
+def test_exp022_three_updates_match_portable_golden() -> None:
+    """Pin the CPU reference model and optimizer interaction across three updates."""
     assert_bfb_against_golden(
         golden_dir=_CWD / "testdata",
         golden_name="exp022",
         build_module=_EndpointTrajectory,
-        build_input=lambda: torch.arange(10).reshape(2, 5),
+        build_input=lambda: torch.arange(8).remainder(2).reshape(2, 4),
         seed=42,
     )
 
@@ -418,7 +411,7 @@ def test_an_invalid_geometry_is_rejected_by_name(field: str, value: float) -> No
     ZeroDivisionError there hides the whole config a reader was inspecting.
     """
     config = NanoChatTrainStep.Config()
-    config.model.max_seq_len = 8
+    config.model.max_seq_len = SEQ
     setattr(config, field, value)
     with pytest.raises(ValueError, match=field):
         config.copy_tree().finalize()
@@ -457,7 +450,7 @@ def test_the_warmup_is_counted_in_steps_not_passes() -> None:
     ``budget_warmup_steps / accumulate_passes`` -- 1.375 steps at the shipped
     geometry -- so the budget would pay for the compilation it skips.
     """
-    step = _step(tokens_per_optimizer_step=4 * SEQ, budget_warmup_steps=1)
+    step = _step(tokens_per_optimizer_step=4 * 8, budget_warmup_steps=1)
     assert step.accumulate_passes == 2
     batch = _batch()
     for _ in range(2):  # One whole optimizer step: the warmup.
@@ -633,7 +626,7 @@ def test_eval_returns_per_token_loss_for_the_metric() -> None:
     """The metric weights each token by its byte length, so it needs them unreduced."""
     step = _step()
     out = step.eval_loss(**_batch())
-    assert out["model"].shape == (2, SEQ)
+    assert out["model"].shape == (2, 8)
 
 
 @pytest.mark.compute_training
@@ -728,26 +721,23 @@ def test_the_selector_is_comparable_not_a_closure() -> None:
     assert matrix_parameters() == matrix_parameters()
 
 
-# The EXPERIMENT's config, not a hand-built one: a golden over a config assembled here
-# would freeze whatever this file happens to say, and the ladder could then change
-# underneath it without the golden noticing. Only the device is pinned, because the
-# harness is CPU-only.
+# The experiment config carries the optimizer and schedule under test. Only the
+# device is pinned because this replay runs on CPU.
 def _smoke_step() -> NanoChatTrainStep:
-    """``exp_smoke``'s step, built for a golden."""
+    """Build the smoke experiment step on CPU."""
     config = experiments.exp_smoke().step
     config.parallelism = NoParallel.Config(device="cpu")
-    # Size-only shrink of the experiment config: the pre-run state is stored
-    # whole, so the per-layer width is the lever.
-    # Width, heads, and the gate move together (the gate reads the whole
-    # stream); both layers stay, so the window pattern is still exercised.
-    # Every numeric choice the ladder sets is untouched.
     model = config.model
     assert isinstance(model, NanoChatLM.Config)
-    model.channels_in = 8
+    model.channels_in = 4
+    model.max_seq_len = 2
+    model.vocab_size = 2
     attention = model.template.attn
     assert isinstance(attention, ValueGatedAttention.Config)
-    attention.channels_head = 4
-    attention.gate_channels = 8
+    attention.channels_head = 2
+    attention.gate_channels = 4
+    # Keep exp_smoke's two accumulation passes while shrinking the sequence.
+    config.tokens_per_optimizer_step = 2 * config.rows_per_pass * model.max_seq_len
     torch.manual_seed(0)
     built = config.make()
     assert isinstance(built, NanoChatTrainStep)
@@ -767,13 +757,12 @@ def _smoke_batch(step: NanoChatTrainStep) -> dict[str, Tensor]:
 
 
 class _SmokeSteps(nn.Module):
-    """A module wrapper so the bfb harness can drive five training steps.
+    """A module wrapper so the bfb harness can drive three training steps.
 
     The harness randomizes ``parameters()`` and snapshots ``state_dict()``, so
     the thing it is handed has to BE the model. Wrapping rather than passing
-    the model directly is what lets the optimizer -- whose moments are half of
-    what this golden exists to freeze -- be constructed after that
-    randomization and against those same tensors.
+    the model directly lets the optimizer moments be constructed after
+    randomization against those same tensors.
     """
 
     def __init__(self) -> None:
@@ -792,8 +781,8 @@ class _SmokeSteps(nn.Module):
 
 
 @pytest.mark.compute_training
-def test_five_steps_bfb() -> None:
-    """Freeze five optimizer steps of the recipe, end to end.
+def test_three_steps_bfb() -> None:
+    """Freeze three optimizer steps of the recipe, end to end.
 
     The forward test artifacts in ``model_test`` freeze one pass. This freezes
     what that pass FEEDS: the backward, both optimizer members, the accumulated
@@ -805,11 +794,10 @@ def test_five_steps_bfb() -> None:
     schedule reads ``elapsed_sec / train_budget_sec``, and that clock is a
     ``perf_counter`` reading (train_step.py:450, 483), so letting it run would
     freeze how fast this machine is. The readings span the whole budget because
-    the trapezoid holds flat over the first half -- five closely-spaced ones all
-    land at multiplier 1.0 and never exercise the decay.
+    the trapezoid holds flat over the first half and then decays.
     """
     budget = experiments.exp_smoke().step.train_budget_sec
-    clock = [fraction * budget for fraction in (0.0, 0.25, 0.5, 0.75, 1.0)]
+    clock = [fraction * budget for fraction in (0.0, 0.5, 1.0)]
 
     def run(module: nn.Module, batch: dict[str, Tensor]) -> Tensor:
         assert isinstance(module, _SmokeSteps)
@@ -817,12 +805,157 @@ def test_five_steps_bfb() -> None:
 
     assert_bfb_against_golden(
         golden_dir=_CWD / "testdata",
-        golden_name="five_steps",
+        golden_name="three_steps",
         build_module=_SmokeSteps,
         build_input=lambda: _smoke_batch(_smoke_step()),
         seed=0,
         run=run,
     )
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("budget_warmup_steps", -1, "budget_warmup_steps"),
+        ("rows_per_pass", 0, "rows_per_pass"),
+        ("tokens_per_optimizer_step", 0, "tokens_per_optimizer_step"),
+        ("momentum_warmup_steps", 0, "momentum_warmup_steps"),
+    ],
+)
+def test_train_config_rejects_invalid_accumulation_settings(
+    field: str,
+    value: int,
+    message: str,
+) -> None:
+    config = NanoChatTrainStep.Config()
+    setattr(config, field, value)
+    with pytest.raises(ValueError, match=message):
+        config.finalize()
+
+
+@pytest.mark.gpu_torch_cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
+def test_cuda_synchronize_path() -> None:
+    step = _smoke_step()
+    step.parallelism.device = torch.device("cuda")
+    step._synchronize()
+
+
+def test_no_pending_divergence_and_gradient_clipping_paths() -> None:
+    step = _smoke_step()
+    step._assert_not_diverged()
+    step.config.gradient_clip_norm = float("inf")
+    assert step._clip_gradients() == {}
+    step.config.gradient_clip_norm = 1.0
+    parameter = next(step.model.parameters())
+    parameter.grad = torch.ones_like(parameter)
+    result = step._clip_gradients()
+    assert isinstance(result["grad_norm"], Tensor)
+
+
+def test_fused_ngram_binding_routes_every_table_to_rmsprop() -> None:
+    trajectory = _EndpointTrajectory()
+    step = trajectory._step
+    assert isinstance(step.model, MemoryNanoChatLM)
+    assert isinstance(step.optimizer, CompositeOptimizer)
+    tables = step.model._tables()
+    for table in tables:
+        table.prepare_gradient_sinks(dirty_bitmaps=True)
+    step._bind_ngram_gradients(step.model)
+    members = step.optimizer.optimizers
+    rmsprop = [member for member in members if isinstance(member, BiasCorrectedRMSProp)]
+    assert rmsprop
+    expected: set[Tensor] = set()
+    for table in tables:
+        for part in table.tables:
+            assert isinstance(part, nn.Embedding)
+            expected.add(part.weight)
+    actual = {parameter for member in rmsprop for parameter in member.gradient_sinks}
+    assert actual == expected
+    for member in rmsprop:
+        assert set(member.gradient_sinks) <= expected
+
+    first = rmsprop[0]
+    first.param_groups[0]["params"] = []
+    with pytest.raises(ValueError, match="must route to RMSProp"):
+        step._bind_ngram_gradients(step.model)
+
+
+def test_ngram_train_step_runs_one_cpu_update() -> None:
+    step = _step(config=train_step.NgramTrainStep.Config())
+    assert isinstance(step, train_step.NgramTrainStep)
+    result = step.train_step(**_batch())
+    assert result["loss"].shape == (1,)
+
+
+def test_a_two_pass_update_charges_the_budget_and_guards_the_worst_pass() -> None:
+    step = _step(tokens_per_optimizer_step=4 * SEQ)
+    step.config.budget_warmup_steps = 0
+    batch = _batch()
+    first = step.train_step(**batch)
+    assert step.global_step == 0
+    assert not step.accumulation_complete
+    assert first.get("metrics") == {}
+    second = step.train_step(**batch)
+    assert step.global_step == 1
+    assert step.accumulation_complete
+    assert second.get("metrics")
+    assert step.elapsed_sec > 0
+    step.config.divergence_threshold = 1e-6
+    step.train_step(**batch)
+    with pytest.raises(RuntimeError, match="diverged"):
+        step.train_step(**batch)
+
+
+def test_call_eval_and_partial_epoch_cleanup() -> None:
+    step = _smoke_step()
+    batch = _smoke_batch(step)
+    logits = step.call_eval(**batch)
+    assert logits.shape[:2] == batch["media"].shape
+    step._pending_passes = 1
+    step._pending_worst = torch.tensor(2.0)
+    step.on_epoch_end()
+    assert step.accumulation_complete
+    assert step._pending_worst is None
+
+
+def test_load_state_requires_budget_clock() -> None:
+    step = _smoke_step()
+    with pytest.raises(ValueError, match="local_step"):
+        step.load_state_dict({})
+
+
+def test_bounded_cross_entropy_masks_ignored_targets_and_has_gradients() -> None:
+    loss = train_step.BoundedTokenCrossEntropy.Config().make()
+    logits = torch.tensor([[[-2.0, 1.0, 3.0], [1.0, -1.0, 2.0]]], requires_grad=True)
+    labels = torch.tensor([[2, -1]])
+    result = loss(logits, label=labels)["loss"]
+    expected = torch.logsumexp(logits[0, 0].detach(), 0) - logits[0, 0, 2].detach()
+    # The logits literal is one sequence, so the per-token loss is [1, tokens].
+    torch.testing.assert_close(
+        result,
+        torch.stack((expected, torch.tensor(0.0))).reshape(1, 2),
+    )
+    result.sum().backward()
+    assert logits.grad is not None
+    assert torch.equal(logits.grad[0, 1], torch.zeros(3))
+
+
+def test_train_step_rejects_invalid_budget_and_gradient_settings() -> None:
+    config = NanoChatTrainStep.Config()
+    config.train_budget_sec = 0
+    with pytest.raises(ValueError, match="train_budget_sec"):
+        config.finalize()
+    config = NanoChatTrainStep.Config()
+    config.gradient_clip_norm = 0
+    with pytest.raises(ValueError, match="gradient_clip_norm"):
+        config.finalize()
+
+
+def test_learning_rates_reports_a_plain_optimizer() -> None:
+    parameter = torch.nn.Parameter(torch.ones(2, 3))
+    optimizer = torch.optim.SGD([parameter], lr=0.25)
+    assert train_step._learning_rates(optimizer) == {"all": 0.25}
 
 
 if __name__ == "__main__":

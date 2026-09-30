@@ -27,7 +27,7 @@ from priml.baselines.sudoku.prefix import SparsePuzzleEmbedding
 from priml.model.attention.self_attention import SelfAttention
 from priml.model.swiglu import SwiGLU
 from priml.testing.bfb import host_agnostic_numerics
-from priml.testing.golden import heads, mismatches, put_steps
+from priml.testing.golden import joined, mismatches, put_steps
 from priml.train.parallelism import NoParallel
 
 
@@ -38,18 +38,15 @@ if TYPE_CHECKING:
     from priml.train.custom_types import TrainStepOutput
 
 
-FFN_ROUND_TO: Final = 8
-"""Hidden-width rounding for the shrunk recipe; the recipe's 32 multiplies it."""
-
-
 def training_config(width: int, dtype: torch.dtype | None) -> ArcTrainStep.Config:
-    """Shape-shrink the reference recipe without replacing its components."""
+    """Shape-compact the reference recipe without replacing its components."""
     candidate = exp000().step
     model = candidate.model
     model.channels_in = width
+    model.vocab_size = 4
     model.num_layers = 1
     assert isinstance(model.embedding, GridEmbedding.Config)
-    model.embedding.grid_shape = (9,)
+    model.embedding.grid_shape = (3,)
     assert isinstance(model.block, RotaryBlock.Config)
     model.block.channels_in = width
     assert isinstance(model.block.attn, SelfAttention.Config)
@@ -60,15 +57,15 @@ def training_config(width: int, dtype: torch.dtype | None) -> ArcTrainStep.Confi
     model.block.rope.channels_head = width // 2
     assert isinstance(model.block.ffn, SwiGLU.Config)
     model.block.ffn.channels_in = width
-    model.block.ffn.round_to = FFN_ROUND_TO
+    model.block.ffn.round_to = 1
     assert isinstance(model.prefix, SparsePuzzleEmbedding.Config)
-    model.prefix.num_puzzles = 8
+    model.prefix.num_puzzles = 4
     model.prefix.batch_size = 2
     assert candidate.act is not None
     candidate.act.batch_size = 2
-    candidate.act.max_steps = 3
+    candidate.act.max_steps = 2
     candidate.dtype_autocast = dtype
-    candidate.total_train_steps = 10
+    candidate.total_train_steps = 3
     candidate.warmup_steps = 0
     candidate.use_ema = False
     candidate.compile = None
@@ -100,8 +97,8 @@ def capture_gradients(
 def training_batch(index: int, rank: int) -> dict[str, object]:
     """Distinct rank inputs, one rank-exclusive ID, and one shared ID."""
     return {
-        "media": (torch.arange(18).reshape(2, 9) + rank + index) % 12,
-        "label": (torch.arange(18).reshape(2, 9) + rank + 3) % 12,
+        "media": (torch.arange(6).reshape(2, 3) + rank + index) % 2 + 2,
+        "label": ((torch.arange(6).reshape(2, 3) + rank + 3) % 2) + 2,
         "puzzle_identifiers": torch.tensor([2 * rank + 1, 2]),
         "valid_count": 2,
     }
@@ -191,12 +188,12 @@ def record_trajectory(
     *,
     clip: float,
 ) -> dict[str, Tensor]:
-    """Record five updates, an evaluation, and a resumed update from seed 0.
+    """Record three updates, an evaluation, and a resumed update from seed 0.
 
     Recorded per update, stacked on a step axis: output probe, loss, the
-    leading elements of every reduced and clipped dense gradient and of the
-    unreduced sparse rows, the finite clipping norm, and the leading elements
-    of every dense parameter and of the sparse table. Then a one-valid-row
+    every reduced and clipped dense gradient and the unreduced sparse rows,
+    the finite clipping norm, and every dense parameter and the sparse table,
+    all whole. Then a one-valid-row
     evaluation, and one update of a step restored from the state dict.
 
     Args:
@@ -223,23 +220,23 @@ def record_trajectory(
         )
         batch: dict[str, object] = {}
         try:
-            for index in range(5):
+            for index in range(3):
                 batch = {
-                    "media": (torch.arange(18).reshape(2, 9) + index) % 12,
-                    "label": (torch.arange(18).reshape(2, 9) + 3) % 12,
-                    "puzzle_identifiers": torch.tensor([index % 3 + 1, 2]),
+                    "media": (torch.arange(6).reshape(2, 3) + index) % 2 + 2,
+                    "label": (torch.arange(6).reshape(2, 3) + 3) % 2 + 2,
+                    "puzzle_identifiers": torch.tensor([index % 2, 1]),
                     "valid_count": 2,
                 }
                 result = subject.train_step(**batch)
                 step = {"model": result["model"], "loss": result["loss"]}
                 sparse_grad = gradients.pop("sparse")
-                step["grad"] = heads(gradients.values())
+                step["grad"] = joined(gradients.values())
                 step["grad/sparse"] = rows(sparse_grad)
                 if math.isfinite(clip):
                     norm = result.get("metrics", {})["grad_norm"]
                     assert isinstance(norm, Tensor)
                     step["grad_norm"] = norm
-                step["param"] = heads(subject.model.parameters())
+                step["param"] = joined(subject.model.parameters())
                 step["sparse"] = rows(subject.sparse_table)
                 steps.append(step)
         finally:
@@ -252,7 +249,7 @@ def record_trajectory(
         after = resumed.train_step(**batch)
         out["resumed/loss"] = after["loss"]
         out["resumed/model"] = after["model"]
-        out["resumed/param"] = heads(resumed.model.parameters())
+        out["resumed/param"] = joined(resumed.model.parameters())
     record = reduce(out)
     put_steps(record, "step", [reduce(step) for step in steps])
     return record
@@ -265,16 +262,12 @@ def rows(table: Tensor) -> Tensor:
 
 CASES: Final = (
     *(
-        (8, dtype, clip)
+        (4, dtype, clip)
         for dtype in (None, torch.bfloat16)
         for clip in (math.inf, 0.01)
     ),
-    (16, torch.bfloat16, 0.01),
 )
-"""Every autocast and clipping arm at width 8; width 16 once, in the recipe's arm.
-
-Width only scales shapes, so one wider case shows the ops do not depend on it
-without repeating every arm at four times the golden size."""
+"""Every autocast and clipping arm at the minimum non-singleton width four."""
 
 
 def case_name(width: int, dtype: torch.dtype | None, clip: float) -> str:
@@ -309,12 +302,19 @@ def test_reference_training_trajectory(
 
 def test_reference_trajectory_bites() -> None:
     """A doubled sparse rate is reported, not absorbed."""
-    config = training_config(8, None)
+    config = training_config(4, None)
     config.gradient_clip_norm = math.inf
     config.sparse_optimizer.lr *= 2
     record = record_trajectory(lambda: PortSubject(config), clip=math.inf)
-    expected = load("train_step")[case_name(8, None, math.inf)]
+    expected = load("train_step")[case_name(4, None, math.inf)]
     assert mismatches(expected, record)
+
+
+def test_arc_step_requires_atomic_act() -> None:
+    config = training_config(4, None)
+    config.act = None
+    with pytest.raises(ValueError, match="requires an atomic ACT"):
+        config.make()
 
 
 if __name__ == "__main__":

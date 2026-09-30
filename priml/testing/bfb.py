@@ -2,12 +2,11 @@
 
 Pattern:
 
-1. **Build** a module at minimum width: 1 layer, hidden=8, smallest seq_len.
+1. **Build** a module at minimum size: every dim at least 2, pairwise distinct.
 2. **Randomize** every parameter with seeded ``torch.randn`` so structurally-zero
    inits (q-head bias, etc.) don't hide a regression.
-3. **Snapshot** to ``<test_file_dir>/testdata/`` the pre-run state and input
-   whole, and a SHA-256 plus the first elements of the output and of any
-   changed post-run state.
+3. **Snapshot** to ``<test_file_dir>/testdata/`` the pre-run state, input,
+   output, and every post-run tensor the run changed, all whole.
 4. **Assert** on subsequent runs that loading the golden state and applying it
    to the same input reproduces the output and post-run state bit for bit.
 
@@ -54,7 +53,10 @@ Cross-architecture portability (the whole point):
   MKL takes a generic path, and broke goldens on Intel.
 
 Determinism is required: the harness enables deterministic Torch algorithms
-and seeds the CPU default generator before any tensor allocation.
+and seeds the CPU default generator before any tensor allocation. Every step --
+building the module, randomizing it, building the input, and running -- sits
+inside one ``host_agnostic_numerics``, so an initializer or input drawn with
+``randn`` is as portable as the forward.
 
 Usage::
 
@@ -120,7 +122,6 @@ from typing import (
     override,
 )
 
-import hashlib
 import os
 import tempfile
 
@@ -131,12 +132,12 @@ from torch.utils._python_dispatch import TorchDispatchMode
 
 import torch
 
-from priml.lib.custom_json import ListCodec
+from priml.lib.custom_json import DictCodec, ListCodec
 from priml.testing.golden import pack, unpack
 
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Generator, Mapping, Sequence
+    from collections.abc import Callable, Generator, Iterable, Mapping, Sequence
 
     from torch._ops import OpOverload
 
@@ -445,11 +446,10 @@ def assert_bfb_against_golden[InputT](
     First call (no golden file present, or ``BFB_REGENERATE=1`` set):
       - Builds the module, builds the input, randomizes parameters under
         ``seed``, runs ``module(input)``, and writes ``{golden_name}.pt``
-        containing the pre-run state_dict and input whole, and a SHA-256 plus
-        the first elements of the output and, when the run mutates state, of
-        every post-run tensor. ``randomize_parameters`` uses its own seeded
-        generator, so it is independent of the global RNG ``build_input`` may
-        consume.
+        containing the pre-run state_dict, input, output, and every post-run
+        tensor the run changed, all whole. ``randomize_parameters`` uses its own
+        seeded generator, so it is independent of the global RNG ``build_input``
+        may consume.
       - Immediately reloads the just-written golden, reruns, and asserts
         it round-trips bit-exactly. Regeneration fails loudly otherwise, so a
         non-reproducible golden is never committed.
@@ -483,51 +483,19 @@ def assert_bfb_against_golden[InputT](
 
     """
     state = _capture_torch_process_state()
+    # Everything the golden stores or replays is computed in here, not only the
+    # run: an initializer, an unsaved buffer, and the input each draw or compute
+    # through vector-ISA-dependent kernels when left native.
     try:
-        golden_dir.mkdir(parents=True, exist_ok=True)
-        golden_path = golden_dir / f"{golden_name}.pt"
-        missing = not golden_path.exists()
-        regenerate = os.environ.get(_ENV_REGENERATE, "0") == "1"
-        runner = _default_runner if run is None else run
-
-        if missing or regenerate:
-            with tempfile.NamedTemporaryFile(
-                dir=golden_dir,
-                prefix=f".{golden_name}.",
-                suffix=".pt",
-                delete=False,
-            ) as candidate_file:
-                candidate_path = Path(candidate_file.name)
-            try:
-                _write_golden(
-                    golden_path=candidate_path,
-                    build_module=build_module,
-                    build_input=build_input,
-                    seed=seed,
-                    run=runner,
-                )
-                _replay_golden(
-                    golden_path=candidate_path,
-                    build_module=build_module,
-                    seed=seed,
-                    run=runner,
-                )
-                candidate_path.replace(golden_path)
-            finally:
-                candidate_path.unlink(missing_ok=True)
-            if missing:
-                raise _MissingGoldenError(
-                    f"Missing golden regenerated at {golden_path}; inspect it, "
-                    "then rerun the test.",
-                )
-            return
-
-        _replay_golden(
-            golden_path=golden_path,
-            build_module=build_module,
-            seed=seed,
-            run=runner,
-        )
+        with host_agnostic_numerics():
+            _assert_bfb(
+                golden_dir=golden_dir,
+                golden_name=golden_name,
+                build_module=build_module,
+                build_input=build_input,
+                seed=seed,
+                run=_default_runner if run is None else run,
+            )
     finally:
         _restore_torch_process_state(state)
 
@@ -578,68 +546,24 @@ def regenerate_golden[InputT](
             os.environ[_ENV_REGENERATE] = prior
 
 
-def state_differs(before: Mapping[str, Tensor], after: Mapping[str, Tensor]) -> bool:
-    """Whether any stored tensor changed across the run.
-
-    Public because it decides whether a golden STORES a post-run state, so
-    anything reasoning about that key asks the same question. A second
-    spelling of "did the state change" is how two callers drift.
-
-    Args:
-      before: State captured before the run.
-      after: State captured after it.
-
-    Returns:
-      differs: Whether any entry changed.
-
-    """
-    if before.keys() != after.keys():
-        return True
-    return any(
-        not _tensor_bits_equal(value, after[key]) for key, value in before.items()
-    )
-
-
 class _Golden(TypedDict):
     """What a golden file stores.
 
-    ``post_state_digest`` and ``post_state_heads`` are absent when the run
-    mutated nothing, which the replay reads as "equal to ``state_dict``".
+    ``post_state`` holds only the tensors the run changed; every other entry's
+    expectation is its ``state_dict`` value. It is absent when nothing changed.
     """
 
     state_dict: dict[str, Tensor]
     input: object
-    output_digest: Tensor
-    output_head: Tensor
+    output: Tensor
     seed: int
-    post_state_digest: NotRequired[dict[str, Tensor]]
-    post_state_heads: NotRequired[dict[str, Tensor]]
+    post_state: NotRequired[dict[str, Tensor]]
 
 
-# The pre-run state is the replay's INPUT, so it is stored whole. The output and the
-# post-run state are only ever compared, so a SHA-256 of each tensor's dtype, shape,
-# and bytes pins every bit; the first elements ride along so a mismatch still reports
-# its size in ULPs. ``torch.save`` frames every tensor as its own ~300-byte storage, so
-# each record is packed: one flat tensor per dtype plus an index.
-_HEAD: Final = 4
-
-
-def state_digest(value: Tensor) -> Tensor:
-    """Return the SHA-256 of a tensor's dtype, shape, and bytes, as 32 ``uint8``.
-
-    Args:
-      value: A state tensor.
-
-    Returns:
-      digest: ``[32]`` ``uint8``.
-
-    """
-    flat = value.detach().cpu().contiguous().reshape(-1)
-    hasher = hashlib.sha256(f"{value.dtype}{tuple(value.shape)}".encode())
-    hasher.update(flat.view(torch.uint8).numpy().tobytes())
-    return torch.frombuffer(bytearray(hasher.digest()), dtype=torch.uint8)
-
-
+# Every comparand is stored whole: a mismatch then names the element and its ULP
+# distance, and the expected values can be read and diffed. Never a digest -- see the
+# bit-for-bit skill. ``torch.save`` frames every tensor as its own ~300-byte storage,
+# so each record is packed: one flat tensor per dtype plus an index.
 def save_golden(path: Path, payload: _Golden) -> None:
     """Write a golden with each record packed.
 
@@ -649,10 +573,8 @@ def save_golden(path: Path, payload: _Golden) -> None:
 
     """
     stored: dict[str, object] = {**payload, "state_dict": pack(payload["state_dict"])}
-    if "post_state_digest" in payload:
-        stored["post_state_digest"] = pack(payload["post_state_digest"])
-    if "post_state_heads" in payload:
-        stored["post_state_heads"] = pack(payload["post_state_heads"])
+    if "post_state" in payload:
+        stored["post_state"] = pack(payload["post_state"])
     torch.save(stored, path)
 
 
@@ -668,35 +590,58 @@ def load_golden(path: Path) -> _Golden:
     """
     payload = cast(_Golden, torch.load(path, weights_only=False, map_location="cpu"))
     payload["state_dict"] = unpack(payload["state_dict"])
-    if "post_state_digest" in payload:
-        payload["post_state_digest"] = unpack(payload["post_state_digest"])
-    if "post_state_heads" in payload:
-        payload["post_state_heads"] = unpack(payload["post_state_heads"])
+    if "post_state" in payload:
+        payload["post_state"] = unpack(payload["post_state"])
     return payload
 
 
-def post_state_record(state: Mapping[str, Tensor]) -> _PostState:
-    """Return the digests and leading elements that pin a post-run state.
+def stale_post_states(paths: Iterable[Path]) -> list[Path]:
+    """Return the bfb goldens whose post-run state repeats an unchanged tensor.
+
+    Replay reads an absent post-run entry as "equal to the pre-run state", so a
+    stored copy of an unchanged tensor asserts nothing and only costs bytes.
 
     Args:
-      state: The post-run state dict.
+      paths: Candidate ``.pt`` files; ones that are not bfb goldens are skipped.
 
     Returns:
-      record: ``digest`` and ``heads``, each keyed like ``state``.
+      stale: The goldens storing at least one unchanged post-run tensor.
+
+    """
+    stale: list[Path] = []
+    for path in paths:
+        raw = DictCodec.coerce(
+            cast(object, torch.load(path, map_location="cpu", weights_only=False)),
+            default=None,
+        )
+        if "post_state" not in raw or "state_dict" not in raw:
+            continue
+        payload = load_golden(path)
+        post = payload.get("post_state", {})
+        if len(changed_state(payload["state_dict"], post)) < len(post):
+            stale.append(path)
+    return stale
+
+
+def changed_state(
+    before: Mapping[str, Tensor],
+    after: Mapping[str, Tensor],
+) -> dict[str, Tensor]:
+    """Return the entries of ``after`` that are new or differ bitwise from ``before``.
+
+    Args:
+      before: State captured before the run.
+      after: State captured after it.
+
+    Returns:
+      changed: Detached CPU copies of the changed entries, keyed like ``after``.
 
     """
     return {
-        "digest": {key: state_digest(value) for key, value in state.items()},
-        "heads": {
-            key: value.detach().reshape(-1)[:_HEAD].cpu().clone()
-            for key, value in state.items()
-        },
+        key: value.detach().to("cpu", copy=True)
+        for key, value in after.items()
+        if key not in before or not _tensor_bits_equal(before[key], value)
     }
-
-
-class _PostState(TypedDict):
-    digest: dict[str, Tensor]
-    heads: dict[str, Tensor]
 
 
 # bfloat16 and float16 are refused too, not float64 alone: the harness computes in all
@@ -737,28 +682,15 @@ def _replay_golden[InputT](
     payload = load_golden(golden_path)
     module.load_state_dict(payload["state_dict"])
     inp = cast(InputT, move_to_device(payload["input"], device))
-    with host_agnostic_numerics():
-        output = run(module, inp)
+    output = run(module, inp)
     # Checked on replay too, not only at mint: a runner changed to return float64
-    # after the golden was minted is reported by cause, not as an opaque digest
+    # after the golden was minted is reported by cause, not as a last-bit
     # mismatch on someone else's host.
     _assert_portable_output_dtype(output)
-    _assert_digest_match(
-        output,
-        digest=payload["output_digest"],
-        head=payload["output_head"],
-        label="output",
-    )
-    # Absent means the run did not mutate its state, so the pre-run copy IS
-    # the expectation -- a mutation introduced later then fails against it.
-    expected: _PostState = (
-        {
-            "digest": payload["post_state_digest"],
-            "heads": payload["post_state_heads"],
-        }
-        if "post_state_digest" in payload and "post_state_heads" in payload
-        else post_state_record(payload["state_dict"])
-    )
+    _assert_equal(output, payload["output"], label="output")
+    # An entry the run did not change is expected to equal its pre-run copy, so a
+    # mutation introduced later fails against it.
+    expected = {**payload["state_dict"], **payload.get("post_state", {})}
     _assert_state_match(module, expected)
 
 
@@ -774,10 +706,10 @@ def _default_runner(module: nn.Module, inp: object) -> Tensor:
     return result
 
 
-def _assert_state_match(module: nn.Module, golden: _PostState) -> None:
+def _assert_state_match(module: nn.Module, expected: Mapping[str, Tensor]) -> None:
     live = module.state_dict()
     live_keys = set(live.keys())
-    golden_keys = set(golden["digest"].keys())
+    golden_keys = set(expected.keys())
     if live_keys != golden_keys:
         added = live_keys - golden_keys
         removed = golden_keys - live_keys
@@ -785,28 +717,7 @@ def _assert_state_match(module: nn.Module, golden: _PostState) -> None:
             f"state_dict keys differ: added={sorted(added)} removed={sorted(removed)}",
         )
     for k in sorted(live_keys):
-        _assert_digest_match(
-            live[k],
-            digest=golden["digest"][k],
-            head=golden["heads"][k],
-            label=f"state[{k}]",
-        )
-
-
-def _assert_digest_match(
-    value: Tensor,
-    *,
-    digest: Tensor,
-    head: Tensor,
-    label: str,
-) -> None:
-    """Compare the leading elements (for a ULP report), then every bit via SHA-256."""
-    _assert_equal(value.detach().reshape(-1)[:_HEAD].cpu(), head, label=label)
-    if not torch.equal(state_digest(value), digest):
-        raise AssertionError(
-            f"{label}: bitwise comparison failed (dtype, shape, or an element "
-            f"past the first {_HEAD})",
-        )
+        _assert_equal(live[k].detach(), expected[k], label=f"state[{k}]")
 
 
 def _to_cpu(value: object) -> object:
@@ -831,6 +742,34 @@ def _cpu_state_dict(state_dict: Mapping[str, Tensor]) -> dict[str, Tensor]:
     return {
         key: value.detach().to("cpu", copy=True) for key, value in state_dict.items()
     }
+
+
+def _assert_same_input(live: object, stored: object, *, label: str) -> None:
+    """Assert a rebuilt input equals the recorded one, recursing into containers."""
+    live_type: type = type(live)
+    stored_type: type = type(stored)
+    both_maps = live_type is dict and stored_type is dict
+    both_sequences = live_type in {list, tuple} and stored_type in {list, tuple}
+    if both_maps:
+        live_map = cast(dict[str, object], live)
+        stored_map = cast(dict[str, object], stored)
+        if live_map.keys() != stored_map.keys():
+            raise AssertionError(
+                f"{label}: keys differ {sorted(live_map)} vs {sorted(stored_map)}",
+            )
+        for key, value in live_map.items():
+            _assert_same_input(value, stored_map[key], label=f"{label}[{key!r}]")
+    elif both_sequences:
+        live_seq = cast("Sequence[object]", live)
+        stored_seq = cast("Sequence[object]", stored)
+        if len(live_seq) != len(stored_seq):
+            raise AssertionError(
+                f"{label}: length {len(live_seq)} vs {len(stored_seq)}",
+            )
+        for index, (a, b) in enumerate(zip(live_seq, stored_seq, strict=True)):
+            _assert_same_input(a, b, label=f"{label}[{index}]")
+    else:
+        _assert_equal(live, stored, label=label)
 
 
 def _assert_equal(a: object, b: object, *, label: str) -> None:
@@ -1309,7 +1248,7 @@ def _write_golden[InputT](
     seed: int,
     run: Callable[[nn.Module, InputT], Tensor],
 ) -> None:
-    """Build, randomize, run; store the pre-run state and digest the rest."""
+    """Build, randomize, run; store the pre-run state, input, output, and changes."""
     torch.use_deterministic_algorithms(True)
     _seed_bfb(seed)
     module = build_module()
@@ -1319,21 +1258,78 @@ def _write_golden[InputT](
     inp = build_input()
     randomize_parameters(module, seed=seed)
     pre_state = _cpu_state_dict(module.state_dict())
-    with host_agnostic_numerics():
-        output = run(module, inp)
+    output = run(module, inp)
     _assert_portable_output_dtype(output)
-    post_state = _cpu_state_dict(module.state_dict())
     payload: _Golden = {
         "state_dict": pre_state,
         "input": _to_cpu(inp),
-        "output_digest": state_digest(output),
-        "output_head": output.detach().reshape(-1)[:_HEAD].cpu().clone(),
+        "output": output.detach().to("cpu", copy=True),
         "seed": seed,
     }
-    # Absence means "unchanged", which the replay asserts against the pre-run
-    # copy -- so omitting it is not a weaker check.
-    if state_differs(pre_state, post_state):
-        record = post_state_record(post_state)
-        payload["post_state_digest"] = record["digest"]
-        payload["post_state_heads"] = record["heads"]
+    # Unchanged entries are asserted against the pre-run copy, so storing only
+    # the changed ones is not a weaker check.
+    if post_state := changed_state(pre_state, module.state_dict()):
+        payload["post_state"] = post_state
     save_golden(golden_path, payload)
+
+
+def _assert_bfb[InputT](
+    *,
+    golden_dir: Path,
+    golden_name: str,
+    build_module: Callable[[], nn.Module],
+    build_input: Callable[[], InputT],
+    seed: int,
+    run: Callable[[nn.Module, InputT], Tensor],
+) -> None:
+    """Mint or replay a golden; the caller holds ``host_agnostic_numerics``."""
+    golden_dir.mkdir(parents=True, exist_ok=True)
+    golden_path = golden_dir / f"{golden_name}.pt"
+    missing = not golden_path.exists()
+    if missing or os.environ.get(_ENV_REGENERATE, "0") == "1":
+        with tempfile.NamedTemporaryFile(
+            dir=golden_dir,
+            prefix=f".{golden_name}.",
+            suffix=".pt",
+            delete=False,
+        ) as candidate_file:
+            candidate_path = Path(candidate_file.name)
+        try:
+            _write_golden(
+                golden_path=candidate_path,
+                build_module=build_module,
+                build_input=build_input,
+                seed=seed,
+                run=run,
+            )
+            _replay_golden(
+                golden_path=candidate_path,
+                build_module=build_module,
+                seed=seed,
+                run=run,
+            )
+            candidate_path.replace(golden_path)
+        finally:
+            candidate_path.unlink(missing_ok=True)
+        if missing:
+            raise _MissingGoldenError(
+                f"Missing golden regenerated at {golden_path}; inspect it, "
+                "then rerun the test.",
+            )
+        return
+
+    # Replay runs the stored input, so without this a test whose
+    # ``build_input`` changed would keep passing against the stale record.
+    _seed_bfb(seed)
+    build_module()
+    _assert_same_input(
+        _to_cpu(build_input()),
+        load_golden(golden_path)["input"],
+        label="input",
+    )
+    _replay_golden(
+        golden_path=golden_path,
+        build_module=build_module,
+        seed=seed,
+        run=run,
+    )

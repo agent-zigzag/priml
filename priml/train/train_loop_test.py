@@ -268,7 +268,7 @@ class _WeightedEvalStep:
     def train_step(self, **preprocessed_batch: object) -> TrainStepOutput:
         """Unused train step."""
         del preprocessed_batch
-        return {"loss": torch.zeros(1), "model": torch.zeros(1, 1)}
+        return {"loss": torch.zeros(1), "model": torch.zeros(2, 3)}
 
     def call_eval(self, **preprocessed_batch: object) -> object:
         """Return the batch media."""
@@ -324,7 +324,7 @@ class _WarmupStep:
         del preprocessed_batch
         self.global_step += 1
         self.local_step += 1
-        return {"loss": torch.zeros(1), "model": torch.zeros(1, 1)}
+        return {"loss": torch.zeros(1), "model": torch.zeros(2, 3)}
 
     def call_eval(self, **preprocessed_batch: object) -> object:
         """Return eval logits placeholder."""
@@ -830,7 +830,7 @@ def seeded_checkpoints(tmp_path_factory: pytest.TempPathFactory) -> Path:
     loop.train()
     assert (source / "step_00000020.pt").exists()
     # Several one-time torch imports hide under this path: the first optimizer
-    # build pulls in torch._dynamo (417ms on colossus against 3ms warm), the
+    # build pulls in torch._dynamo (417ms on the benchmark host against 3ms warm), the
     # first RESUME pulls in torch.load's deserialization machinery, and the
     # first EVAL pulls in its own. Each is per-process, so leaving them to
     # whichever test runs first bills an arbitrary one -- a different one per
@@ -1844,7 +1844,7 @@ def test_logged_train_loss_is_all_reduced_before_rank_zero_gate(
         step.timer_step.global_count += 1
         return {
             "loss": torch.tensor([1.0]),
-            "model": torch.zeros(1, 2),
+            "model": torch.zeros(2, 3),
             "metrics": {
                 "grad_norm": torch.tensor(2.0),
                 "param_norm": torch.tensor(3.0),

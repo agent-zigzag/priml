@@ -13,7 +13,7 @@ reference itself; these run without a corpus or a network.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import cast
+from typing import Final, cast
 
 import json
 import math
@@ -27,6 +27,7 @@ import pytest
 import tiktoken
 import torch
 
+from priml.baselines.nanochat import data
 from priml.baselines.nanochat.data import (
     NanoChatData,
     ReferenceEvaluation,
@@ -37,32 +38,38 @@ from priml.lib.custom_json import DictCodec, ListCodec, loads
 from priml.metrics.bits_per_byte import BitsPerByte
 
 
-SEQ = 16
-BOS = "<|reserved_0|>"
-RESERVED = tuple(f"<|reserved_{index}|>" for index in range(16))
-VOCAB = 256 + len(RESERVED)
+SEQ: Final = 16
+BOS: Final = "<|reserved_0|>"
+RESERVED: Final = tuple(f"<|reserved_{index}|>" for index in range(16))
+VOCAB: Final = 256 + len(RESERVED)
 
 
 # Byte-level so a document's token count is its byte count, which is what lets a test
 # say which document the packer should have chosen.
-# set.
-def _encoding() -> tiktoken.Encoding:
-    """Return a byte-level vocabulary: every token is one byte, plus the reserved."""
+def _write_shard(root: Path, index: int, documents: list[str]) -> None:
+    """Write one parquet shard holding the given documents, in order."""
+    parquet.write_table(
+        pa.table({"text": documents}),
+        root / f"shard_{index:05d}.parquet",
+    )
+
+
+@pytest.fixture
+def corpus(tmp_path: Path) -> Path:
+    """Return a two-shard corpus of documents whose lengths are distinguishable."""
     ranks = {bytes([value]): value for value in range(256)}
-    return tiktoken.Encoding(
+    encoding = tiktoken.Encoding(
         name="test",
         pat_str=r".",
         mergeable_ranks=ranks,
         special_tokens={
-            name: len(ranks) + index for index, name in enumerate(RESERVED)
+            name: len(ranks) + index
+            for index, name in enumerate(
+                RESERVED,
+            )
         },
     )
-
-
-def _write_tokenizer(root: Path) -> tiktoken.Encoding:
-    """Write the vocabulary in the layout the loader reads."""
-    encoding = _encoding()
-    directory = root / "tokenizer"
+    directory = tmp_path / "tokenizer"
     directory.mkdir(parents=True, exist_ok=True)
     with (directory / "tokenizer.pkl").open("wb") as file:
         pickle.dump(encoding, file)
@@ -83,21 +90,6 @@ def _write_tokenizer(root: Path) -> tiktoken.Encoding:
             },
         ),
     )
-    return encoding
-
-
-def _write_shard(root: Path, index: int, documents: list[str]) -> None:
-    """Write one parquet shard holding the given documents, in order."""
-    parquet.write_table(
-        pa.table({"text": documents}),
-        root / f"shard_{index:05d}.parquet",
-    )
-
-
-@pytest.fixture
-def corpus(tmp_path: Path) -> Path:
-    """Return a two-shard corpus of documents whose lengths are distinguishable."""
-    _write_tokenizer(tmp_path)
     # Lengths 1..8 encoded as repeated distinct characters, so a row states
     # which documents it took and in what order.
     _write_shard(tmp_path, 0, [chr(ord("a") + n) * (n + 1) for n in range(8)])
@@ -152,7 +144,7 @@ def test_the_largest_fitting_document_is_taken_first(corpus: Path) -> None:
     text = data.tokenizer.encoding.decode(
         [int(token) for token in row if int(token) < 256],
     )
-    # Documents are 'a', 'bb', ... 'hhhhhhhh'; each carries a BOS the decode
+    # Documents are 'a', 'bb', ... 'hhhhhhhh'; each carries a BOS marker the decode
     # above drops. A row of 17 slots takes the 8-token document first.
     assert text.startswith("hhhhhhhh")
 
@@ -166,7 +158,7 @@ def test_a_row_is_filled_by_cropping_the_shortest_document(corpus: Path) -> None
     data = _data(corpus)
     batch = next(iter(data.train_dataloader()))
     # A padded position would be a zero the vocabulary never emits here, since
-    # every document contributes its own byte and a BOS.
+    # every document contributes its own byte and a BOS marker.
     assert batch["media"].shape == (2, SEQ)
     assert int(batch["media"].min()) >= 0
     assert not bool((batch["media"] == batch["media"][0, 0]).all())
@@ -285,7 +277,12 @@ def test_the_byte_table_travels_with_the_batch(corpus: Path) -> None:
     assert batch["token_bytes"].shape == (VOCAB,)
     # Reserved tokens carry no bytes, which is what keeps document boundaries
     # out of the denominator.
-    assert int(batch["token_bytes"][-len(RESERVED) :].sum()) == 0
+    assert (
+        int(
+            batch["token_bytes"][-len(RESERVED) :].sum(),
+        )
+        == 0
+    )
 
 
 def test_an_evaluation_extent_that_is_not_whole_batches_is_rejected(
@@ -356,7 +353,7 @@ def test_a_recipe_without_a_fingerprint_is_rejected(corpus: Path) -> None:
     exists to prevent.
     """
     (corpus / "tokenizer" / "tokenizer_recipe.json").write_text(
-        json.dumps({"bos_token": BOS}),
+        json.dumps({"bos_token": "<|reserved_0|>"}),
     )
     with pytest.raises(ValueError, match="token_bytes_sha256"):
         _data(corpus)
@@ -492,7 +489,7 @@ def prepared_config(tmp_path: Path) -> NanoChatData.Config:
         "byte_tables": {
             "primary": {
                 "file": "token_bytes_primary.npy",
-                "total_on_eval_y": 16,
+                "total_on_eval_y": SEQ,
             },
             "literal": {
                 "file": "token_bytes_literal.npy",
@@ -579,9 +576,9 @@ def test_prepared_evaluation_replays_packed_rows_and_primary_byte_rule(
             )
             metric.update(torch.ones_like(batch["label"], dtype=torch.float32), **batch)
         assert seen == [[2, 0, 4, 1], [1, 2, 3, 0]]
-        assert metric.bytes == 16
+        assert metric.bytes == SEQ
         assert metric.nats == 7
-        assert metric.compute()["bpb"] == pytest.approx(7 / (math.log(2) * 16))
+        assert metric.compute()["bpb"] == pytest.approx(7 / (math.log(2) * SEQ))
 
 
 @pytest.mark.parametrize(
@@ -730,6 +727,101 @@ def test_prepared_data_requires_both_manifests(corpus: Path) -> None:
     config.device = "cpu"
     with pytest.raises(ValueError, match="both manifests"):
         config.make()
+
+
+def test_pack_row_prefers_largest_fit_and_crops_shortest() -> None:
+    row = torch.empty(5, dtype=torch.long)
+    buffer = [[1, 2], [3, 4, 5], [6, 7, 8, 9, 10, 11]]
+    position = data._pack_row(row, buffer, position=0)
+    assert position == 3
+    assert row[:3].tolist() == [3, 4, 5]
+    assert len(buffer) == 2
+    position = data._pack_row(row, buffer, position=position)
+    assert position == 5
+    assert row[3:].tolist() == [1, 2]
+
+
+def test_stream_and_config_validation_errors(tmp_path: Path) -> None:
+    config = NanoChatData.Config(batch_size=0)
+    with pytest.raises(ValueError, match="batch_size"):
+        config.make()
+    config = NanoChatData.Config(eval_tokens=1, eval_batch_size=2, max_seq_len=3)
+    with pytest.raises(ValueError, match="whole number"):
+        config.make()
+    with pytest.raises(FileNotFoundError, match="missing"):
+        data._shard_paths(tmp_path / "absent", indices=[2])
+
+
+@pytest.mark.gpu_torch_cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
+def test_cuda_prefetch_stream_matches_serial(corpus: Path) -> None:
+    data = _data(corpus, device="cuda")
+    stream = data.train_dataloader()
+    batch = next(iter(stream))
+    assert batch["media"].device.type == "cuda"
+    assert batch["media"].shape == (2, SEQ)
+
+
+def test_tokenizer_rejects_missing_recipe_and_negative_lengths(corpus: Path) -> None:
+    recipe = corpus / "tokenizer" / "tokenizer_recipe.json"
+    original = recipe.read_text()
+    recipe.write_text(json.dumps({"bos_token": BOS}))
+    with pytest.raises(ValueError, match="token_bytes_sha256"):
+        Tokenizer.from_directory(corpus / "tokenizer")
+    recipe.write_text(original)
+    values = _load_array(corpus / "tokenizer" / "token_bytes.npy")
+    assert isinstance(values, np.ndarray)
+    values[0] = -1
+    np.save(corpus / "tokenizer" / "token_bytes.npy", values)
+    recipe.write_text(
+        json.dumps(
+            {"bos_token": BOS, "token_bytes_sha256": token_bytes_fingerprint(values)},
+        ),
+    )
+    with pytest.raises(ValueError, match="negative"):
+        Tokenizer.from_directory(corpus / "tokenizer")
+
+
+def test_prepared_array_helpers_reject_shape_and_dtype(tmp_path: Path) -> None:
+    path = tmp_path / "array.npy"
+    np.save(path, np.zeros((2, 3), dtype=np.uint16))
+    with pytest.raises(ValueError, match="geometry/dtype"):
+        data._array(path, shape=(3, 2), dtype=np.dtype(np.uint16))
+    np.save(tmp_path / "float.npy", np.zeros(2, dtype=np.float32))
+    with pytest.raises(ValueError, match="one integer"):
+        data._byte_table(tmp_path, metadata={"file": "float.npy"}, vocab=2)
+
+
+def test_reference_validation_rejects_bad_protocol(tmp_path: Path) -> None:
+    path = tmp_path / "bad.npz"
+    np.savez(
+        path,
+        inputs=np.zeros((2, 3), dtype=np.int64),
+        targets=np.zeros((2, 3), dtype=np.int64),
+        score_mask=np.ones((2, 3), dtype=np.bool_),
+        token_bytes=np.ones(4, dtype=np.int64),
+        reference_bytes=np.ones(2, dtype=np.int64),
+        literal_bytes=np.ones(2, dtype=np.int64),
+        batch_size=2,
+        vocab_size=4,
+        bos_token_id=0,
+        protocol="wrong",
+    )
+    with pytest.raises(ValueError, match="protocol"):
+        ReferenceEvaluation.Config(path=path).make()
+
+
+def test_cpu_prefetch_worker_path_replays_prepared_rows(
+    prepared_config: NanoChatData.Config,
+) -> None:
+    dataset = prepared_config.make()
+    stream = dataset.train_dataloader()
+    stream.prefetch = True
+    stream.max_batches = 1
+    batches = list(stream)
+    assert len(batches) == 1
+    assert batches[0]["media"].shape == (1, 4)
+    assert batches[0]["label"].shape == (1, 4)
 
 
 if __name__ == "__main__":

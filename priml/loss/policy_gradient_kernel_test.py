@@ -2,27 +2,20 @@
 
 The kernels are checked against the torch reference at tolerance: Triton's
 ``exp`` is the fast ``ex2.approx`` and its contractions round once where torch
-rounds twice. A golden freezes the kernels' outputs and gradients on one
-128-row minibatch of 256 steps, per GPU model.
+rounds twice. The torch reference itself is pinned bit for bit by the portable
+golden in ``policy_gradient_test.py``.
 """
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-import re
-
 import pytest
 import torch
 
 from priml.loss.policy_gradient import LogProbs, TorchPPO
-from priml.loss.policy_gradient_kernel import TritonPPO
-from priml.testing.golden import assert_text_golden
-from priml.testing.policy_gradient import (
-    portable_minibatch,
-    random_minibatch,
-    rule_entries,
-)
+from priml.loss.policy_gradient_kernel import TritonPPO, _require_cuda
+from priml.testing.policy_gradient import random_minibatch
 
 
 if TYPE_CHECKING:
@@ -53,6 +46,16 @@ def test_off_cuda_every_stage_is_refused() -> None:
             values=batch["values"],
             returns=batch["values"],
         )
+
+
+def test_invalid_horizon_and_cpu_tensor_are_refused_without_cuda() -> None:
+    rule = TritonPPO.Config().make()
+    with pytest.raises(ValueError, match="positive multiple"):
+        rule.check_horizon(0)
+    with pytest.raises(ValueError, match="positive multiple"):
+        rule.check_horizon(TritonPPO.Config.ADVANTAGE_WIDTH + 1)
+    with pytest.raises(ValueError, match="runs on a CUDA device"):
+        _require_cuda(torch.zeros(2))
 
 
 def test_the_kernels_take_the_reference_rules_coefficients() -> None:
@@ -183,37 +186,6 @@ def test_the_advantage_kernel_stores_the_dtype_its_inputs_promote_to() -> None:
         assert ours.dtype == torch.float32
         assert low.dtype == torch.bfloat16
         torch.testing.assert_close(ours, theirs, rtol=1e-5, atol=1e-6)
-
-
-# One name per GPU model with a golden, so each golden file has this test as its owner;
-# minting for a new model starts by adding its name here.
-@pytest.mark.gpu_triton
-@pytest.mark.parametrize("name", ["triton_ppo_nvidia-h200"])
-def test_the_triton_rule_matches_its_golden_on_the_gpu(
-    request: pytest.FixtureRequest,
-    name: str,
-) -> None:
-    """The kernels on one 128-row minibatch of 256 steps, frozen per GPU model.
-
-    The inputs are drawn on the CPU with portable draws, so only the GPU and
-    its kernels decide the bits; another model's golden skips.
-    """
-    if not torch.cuda.is_available():
-        pytest.skip("needs a CUDA device")
-    model = re.sub(r"[^a-z0-9]+", "-", torch.cuda.get_device_name().lower())
-    if name != f"triton_ppo_{model.strip('-')}":
-        pytest.skip(f"{name} is not this GPU's golden ({model})")
-    batch = {
-        key: value.cuda()
-        for key, value in portable_minibatch(rows=128, horizon=256).items()
-    }
-    lines = rule_entries(TritonPPO.Config().make(), batch)
-    assert_text_golden(
-        request,
-        test_file=__file__,
-        name=name,
-        rendered="\n".join(lines),
-    )
 
 
 if __name__ == "__main__":

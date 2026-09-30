@@ -399,7 +399,7 @@ def test_encode_refuses_a_float_image() -> None:
     """A ``[0, 1]`` float image would otherwise encode as near-black."""
     model = tiny().make()
     with pytest.raises(TypeError, match="uint8"):
-        _ = model.encode(torch.rand(1, 3, 16, 16))
+        _ = model.encode(torch.rand(2, 3, 4, 5))
 
 
 def test_initialization_ends_with_vtp_models_post_init_pass() -> None:
