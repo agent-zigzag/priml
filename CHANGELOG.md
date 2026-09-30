@@ -8,16 +8,23 @@ All notable priml changes are documented here. This project follows
 ### Added
 
 - `priml.model.vision_ae`: pretrained vision autoencoders behind one
-  `Autoencoder` protocol (`encode` uint8 images to raw latents, `decode`
-  back to `[0, 1]` pixels). `VariationalAutoencoder` adds `posterior`; the
-  latent a variational `encode` returns is the config's `latent_fn`
-  (`posterior_sample` or `posterior_mode`). Implementations: `INVAE`, `VTP`
-  (`vtp_small`, `vtp_base`, `vtp_large`), and `RAE` (`rae_dinov2_base`),
+  `Autoencoder` protocol (`encode` uint8 images to raw latents, refusing any
+  other dtype; `decode` back to `[0, 1]` pixels). `VariationalAutoencoder`
+  adds `posterior`; the latent a variational `encode` returns is the config's
+  `latent_fn` (`posterior_sample` or `posterior_mode`). Implementations:
+  `INVAE`, `VTP` (`vtp_small`, `vtp_base`, `vtp_large`), and `RAE`
+  (`rae_dinov2_base`),
   each config defaulting to its published checkpoint. Checkpoints are config
   nodes (`HubFile`, `UrlFile`, `LocalFile`) pinned to a revision and SHA-256;
   each config's `latent_norm` holds its published normalizer
   (`ScaleLatents`, `ElementwiseLatentStats`, `ChannelLatentStats`), which
   keeps its reference's operation order.
+- `priml/model/vision_ae/scripts/reference_parity.py`: clones each
+  autoencoder's reference at its pinned commit and proves the port
+  bit-identical, from seeded initialization through encode and decode, with
+  pinned randomness, per-module bisection, a checked function inventory, and
+  branch coverage over both sides. It mints `testdata/rae_reference.pt` and
+  `testdata/vtp_reference.pt`.
 - `priml.math.scalar_quantization`: exact Lloyd-Max fitting on sorted
   samples, the cube-root high-resolution start, standard-normal levels, and
   batched nearest-level `quantize` / `dequantize`.

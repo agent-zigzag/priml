@@ -8,8 +8,10 @@ wrapper every consumer uses.
 
 MIT license and attribution: ``priml/model/vision_ae/IN-VAE-LICENSE``.
 
+``scripts/reference_parity.py`` proves it bit-identical to the reference below.
+
 References:
-  https://github.com/SwayStar123/REG/blob/invae-sprint-rms-rope-valres-cfm-muon-layerwisescaling/models/invae.py
+  https://github.com/SwayStar123/REG/blob/3c51606c801dd9e87ee9ef778782766ab7c379ca/models/invae.py
   https://huggingface.co/REPA-E/e2e-invae
     Leng et al. 2025. REPA-E: Unlocking VAE for end-to-end tuning with latent
     diffusion transformers.
@@ -43,6 +45,7 @@ from priml.model.vision_ae.custom_types import (
     LatentFn,
     LatentNormalizer,
     posterior_sample,
+    require_uint8,
 )
 from priml.model.vision_ae.latent_norm import ScaleLatents
 
@@ -750,7 +753,11 @@ class INVAE(nn.Module):
         Returns:
           posterior: Gaussian over ``[B, channels_latent, h, w]`` latents.
 
+        Raises:
+          TypeError: ``image`` is not uint8.
+
         """
+        require_uint8(image)
         # Not ``rgb2float``: its ``(x - 127.5) / 127.5`` rounds 128 of the 256
         # levels differently from the reference's ``x / 127.5 - 1``, which the
         # published weights and existing corpora saw.

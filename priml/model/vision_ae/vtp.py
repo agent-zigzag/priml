@@ -13,6 +13,8 @@ activation dtype. :class:`VTP` is the configured wrapper every consumer uses.
 
 MIT license with an attribution clause: ``priml/model/vision_ae/VTP-LICENSE``.
 
+``scripts/reference_parity.py`` proves it bit-identical to the reference below.
+
 References:
   https://github.com/MiniMax-AI/VTP/tree/5ce1eb67010fff3c1eed483352483be6a1838556/vtp/models
   https://huggingface.co/MiniMaxAI/VTP-Large-f16d64
@@ -49,10 +51,14 @@ from priml.math.pixel import rgb2float
 from priml.model import norm as priml_norm
 from priml.model.attention.kernel import attention_kernel_cost
 from priml.model.conv import conv_cost
-from priml.model.custom_types import ChannelsIn, propagate_attr
+from priml.model.custom_types import ChannelsIn, TensorModule, propagate_attr
 from priml.model.swiglu import SwiGLU
 from priml.model.vision_ae.checkpoint import HubFile, UrlFile
-from priml.model.vision_ae.custom_types import CheckpointFile, LatentNormalizer
+from priml.model.vision_ae.custom_types import (
+    CheckpointFile,
+    LatentNormalizer,
+    require_uint8,
+)
 from priml.model.vision_ae.latent_norm import ChannelLatentStats
 
 
@@ -246,7 +252,12 @@ class SelfAttention(nn.Module):
 
 
 class SwiGLUFFN(nn.Module):
-    """``w3(silu(w1(x)) * w2(x))``, hidden width ``2/3`` of nominal, aligned up to 8."""
+    """``w3(silu(w1(x)) * w2(x))``, hidden width ``2/3`` of nominal, aligned up to 8.
+
+    Not :class:`priml.model.swiglu.SwiGLU`, whose fused ``up_proj`` and
+    ``down_proj`` would neither load the checkpoint's biased ``w1``, ``w2``, and
+    ``w3`` nor take this width rule.
+    """
 
     def __init__(self, in_features: int, hidden_features: int) -> None:
         super().__init__()
@@ -262,6 +273,10 @@ class SwiGLUFFN(nn.Module):
         return self.w3(functional.silu(x1) * x2)
 
 
+type NormFactory = Callable[[int], TensorModule]
+"""Builds a normalization over the given channel width."""
+
+
 class SelfAttentionBlock(nn.Module):
     """Pre-norm attention then SwiGLU, each added back to the residual stream."""
 
@@ -271,7 +286,7 @@ class SelfAttentionBlock(nn.Module):
         *,
         num_heads: int,
         expansion: float,
-        norm: Callable[[int], nn.Module],
+        norm: NormFactory,
     ) -> None:
         super().__init__()
         self.norm1 = norm(dim)
@@ -281,9 +296,8 @@ class SelfAttentionBlock(nn.Module):
 
     @override
     def forward(self, x: Tensor, rope: tuple[Tensor, Tensor]) -> Tensor:
-        # ``norm`` is injected as a bare Module factory, whose call is untyped.
-        x_attn = x + self.attn(cast("Tensor", self.norm1(x)), rope)
-        return x_attn + self.mlp(cast("Tensor", self.norm2(x_attn)))
+        x_attn = x + self.attn(self.norm1(x), rope)
+        return x_attn + self.mlp(self.norm2(x_attn))
 
 
 def init_weights_vit(module: nn.Module) -> None:
@@ -294,6 +308,24 @@ def init_weights_vit(module: nn.Module) -> None:
             nn.init.zeros_(module.bias)
     if isinstance(module, (nn.LayerNorm, PatchEmbed, RMSNorm)):
         module.reset_parameters()
+
+
+def init_weights_post(module: nn.Module) -> None:
+    """Apply ``VTPModel``'s post-construction pass to one module.
+
+    Hugging Face's ``post_init`` runs it over the whole model after the trunk
+    and decoder have initialized themselves, so its draws replace theirs.
+    """
+    if isinstance(module, nn.Linear):
+        nn.init.trunc_normal_(module.weight, std=0.02)
+        if module.bias is not None:
+            nn.init.zeros_(module.bias)
+    elif isinstance(module, nn.LayerNorm):
+        # Unconditional, as the reference's: a bias-free LayerNorm raises there too.
+        nn.init.ones_(module.weight)
+        nn.init.zeros_(cast("Tensor", module.bias))
+    elif isinstance(module, nn.Embedding):
+        nn.init.normal_(module.weight, std=0.02)
 
 
 class DinoVisionTransformerWithBottleneck(nn.Module):
@@ -836,6 +868,10 @@ class VTP(nn.Module):
             torch.tensor(inverse_std, dtype=torch.float32).view(-1, 1, 1),
             persistent=False,
         )
+        # ``self.modules()`` is pre-order and HF's pass post-order, but only leaves
+        # draw, and both reach the leaves in the same order.
+        for module in self.modules():
+            init_weights_post(module)
         if config.checkpoint is not None:
             state = _autoencoder_state(load_file(config.checkpoint.make().path()))
             self.load_state_dict(state)
@@ -860,9 +896,11 @@ class VTP(nn.Module):
             latent, in ``dtype_autocast`` when set.
 
         Raises:
+          TypeError: ``image`` is not uint8.
           ValueError: A side is not a multiple of ``patch_size``.
 
         """
+        require_uint8(image)
         height, width = image.shape[-2:]
         if height % self.patch_size or width % self.patch_size:
             raise ValueError(

@@ -2,8 +2,8 @@
 
 ``testdata/vtp.pt`` is this port's own golden: randomized weights, input, and
 output digests. ``testdata/vtp_reference.pt`` holds the reference's outputs for
-those same weights and input, minted by running MiniMax-AI/VTP at commit
-5ce1eb6 (its ``VTPModel.get_reconstruction_latents`` and
+those same weights and input, minted by ``scripts/reference_parity.py``
+running MiniMax-AI/VTP at commit 5ce1eb6 (its ``VTPModel.get_reconstruction_latents`` and
 ``get_latents_decoded_images``, with torchvision's ``ToTensor``, ``Normalize``,
 and the reference's inverse ``Normalize`` then clamp) under
 ``host_agnostic_numerics``; replaying it here needs nothing from the reference.
@@ -25,7 +25,7 @@ import torch
 from priml.model.vision_ae.checkpoint import LocalFile, UrlFile
 from priml.model.vision_ae.custom_types import Autoencoder, VariationalAutoencoder
 from priml.model.vision_ae.latent_norm import ChannelLatentStats
-from priml.model.vision_ae.vtp import VTP, vtp_large
+from priml.model.vision_ae.vtp import VTP, init_weights_post, vtp_large
 from priml.testing.bfb import (
     assert_bfb_against_golden,
     host_agnostic_numerics,
@@ -393,6 +393,33 @@ def test_published_large_checkpoint_round_trips() -> None:
     assert torch.isfinite(norm.normalize(latent)).all()
     decoded = model.decode(latent)
     assert (decoded - 128 / 255).abs().mean() < 0.05
+
+
+def test_encode_refuses_a_float_image() -> None:
+    """A ``[0, 1]`` float image would otherwise encode as near-black."""
+    model = tiny().make()
+    with pytest.raises(TypeError, match="uint8"):
+        _ = model.encode(torch.rand(1, 3, 16, 16))
+
+
+def test_initialization_ends_with_vtp_models_post_init_pass() -> None:
+    """VTPModel's ``post_init`` redraws every linear weight after the modules draw theirs.
+
+    ``scripts/reference_parity.py`` proves the result equal to a seeded
+    ``VTPModel``; this pins the order without the reference.
+    """
+    config = tiny().copy_tree().finalize()
+    torch.manual_seed(0)
+    built = config.make()
+    torch.manual_seed(0)
+    expected = nn.Module()
+    expected.trunk = config.trunk.make()
+    expected.pixel_decoder = config.pixel_decoder.make()
+    for module in expected.modules():
+        init_weights_post(module)
+    assert list(built.state_dict()) == list(expected.state_dict())
+    report = mismatches(expected.state_dict(), built.state_dict())
+    assert not report, report
 
 
 if __name__ == "__main__":

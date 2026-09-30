@@ -1,7 +1,8 @@
 """Tests for the RAE wrapper.
 
-``testdata/rae_reference.pt`` was minted OUTSIDE this repository from the
-reference clone at ``a4d18c4``: its ``stage1.RAE`` loaded a tiny
+``testdata/rae_reference.pt`` is minted by ``scripts/reference_parity.py`` from
+the reference clone at ``a4d18c4``, which that run also checks function by
+function: its ``stage1.RAE`` loaded a tiny
 DINOv2-with-registers through ``from_pretrained`` and a tiny decoder through its
 own ``GeneralDecoder``, while the port loaded the same two files strictly, and
 the reference's ``encode``/``decode`` ran under ``host_agnostic_numerics``. The
@@ -19,6 +20,7 @@ from typing import Final
 
 from configgle.testing import assert_pprint_golden
 from torch import Tensor, nn
+from torch.nn import functional
 from torch.utils.flop_counter import FlopCounterMode
 
 import pytest
@@ -191,9 +193,27 @@ def test_encoder_cost_matches_torch() -> None:
 def test_encoder_cost_refuses_an_unpriced_activation() -> None:
     config = tiny().copy_tree().finalize()
     assert isinstance(config.encoder, Dinov2WithRegisters.Config)
-    config.encoder.hidden_act = "silu"
-    with pytest.raises(ValueError, match="no cost model for hidden_act 'silu'"):
+    config.encoder.activation = _unpriced
+    with pytest.raises(TypeError):
         _ = cost(config.encoder, input_grid=8, batch_size=2, dtype=None)
+
+
+def test_encoder_runs_the_injected_activation() -> None:
+    """HF's string schema is bypassed: the configured function is what every MLP calls."""
+    config = tiny()
+    assert isinstance(config.encoder, Dinov2WithRegisters.Config)
+    reference = config.make()
+    config.encoder.activation = functional.silu
+    swapped = config.make()
+    swapped.load_state_dict(reference.state_dict())
+    assert list(swapped.state_dict()) == list(reference.state_dict())
+    image = _image()
+    assert not torch.equal(swapped.encode(image), reference.encode(image))
+
+
+def _unpriced(x: Tensor) -> Tensor:
+    """Return ``x``: an activation with no cost model."""
+    return x
 
 
 def test_decoder_cost_matches_torch() -> None:
@@ -366,6 +386,13 @@ def test_rae_dinov2_base_config_pprint() -> None:
     assert_pprint_golden(
         test_file=__file__, name="rae_config", config=rae_dinov2_base()
     )
+
+
+def test_encode_refuses_a_float_image() -> None:
+    """A ``[0, 1]`` float image would otherwise encode as near-black."""
+    model = tiny().make()
+    with pytest.raises(TypeError, match="uint8"):
+        _ = model.encode(torch.rand(1, 3, 16, 16))
 
 
 if __name__ == "__main__":

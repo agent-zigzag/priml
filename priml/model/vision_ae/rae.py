@@ -25,6 +25,8 @@ Deviations from the reference, each deliberate:
 
 MIT license and attribution: ``priml/model/vision_ae/RAE-LICENSE``.
 
+``scripts/reference_parity.py`` proves it bit-identical to the reference below.
+
 References:
   https://github.com/bytetriper/RAE/blob/a4d18c4db766419cbe7cb8c02cd9f7ceb0ec9041/src/stage1/rae.py
   https://github.com/bytetriper/RAE/blob/a4d18c4db766419cbe7cb8c02cd9f7ceb0ec9041/src/stage1/decoders/decoder.py
@@ -64,7 +66,11 @@ from priml.model.conv import conv_cost
 from priml.model.custom_types import ChannelsIn, propagate_attr
 from priml.model.norm import LayerNorm
 from priml.model.vision_ae.checkpoint import HubFile
-from priml.model.vision_ae.custom_types import CheckpointFile, LatentNormalizer
+from priml.model.vision_ae.custom_types import (
+    CheckpointFile,
+    LatentNormalizer,
+    require_uint8,
+)
 from priml.model.vision_ae.latent_norm import ElementwiseLatentStats
 
 
@@ -141,21 +147,11 @@ class Dinov2WithRegisters(nn.Module):
         eps: float = 1e-6
         """Layer-norm epsilon (HF ``layer_norm_eps``)."""
 
-        hidden_act: str = "gelu"
-        """HF activation name; HF's config validates it as a string and refuses a function."""
+        activation: TensorFn = functional.gelu
+        """MLP activation; the checkpoint's HF ``"gelu"`` is this exact-erf form."""
 
         qkv_bias: bool = True
         """Whether the query, key, and value projections carry a bias."""
-
-        attn_implementation: str = "eager"
-        """HF attention kernel.
-
-        The reference's ``from_pretrained`` resolves ``"sdpa"``, a fused
-        kernel ``host_agnostic_numerics`` cannot reach inside; ``"eager"`` is
-        the plain matmul-softmax sequence. They differ in rounding only:
-        measured on the tiny parity fixture under ``host_agnostic_numerics``,
-        6 of 64 latent values by at most 3 float32 ULP.
-        """
 
         num_leading_tokens: int = 5
         """Tokens dropped before the patches: CLS and four registers.
@@ -207,7 +203,7 @@ class Dinov2WithRegisters(nn.Module):
               cost: Whole-invocation FLOPs, logical bytes, and ownership.
 
             Raises:
-              ValueError: ``hidden_act`` has no cost model.
+              TypeError: ``activation`` has no cost.
 
             """
             # Analytical rather than a hooked meta-device forward (the imagenet
@@ -215,8 +211,6 @@ class Dinov2WithRegisters(nn.Module):
             # formula reads nothing HF owns and costing never imports
             # ``transformers``; the FlopCounterMode test pins it to HF's kernels.
             del kwargs
-            if self.hidden_act != "gelu":
-                raise ValueError(f"no cost model for hidden_act {self.hidden_act!r}")
             height, width = (
                 (input_grid, input_grid) if isinstance(input_grid, int) else input_grid
             )
@@ -237,7 +231,7 @@ class Dinov2WithRegisters(nn.Module):
                 qkv_bias=self.qkv_bias,
                 layer_scale=True,
                 activation=_activation_cost(
-                    functional.gelu,
+                    self.activation,
                     channels=rows * channels_mlp,
                     dtype=dtype,
                 ),
@@ -321,7 +315,9 @@ class Dinov2WithRegisters(nn.Module):
             num_hidden_layers=config.num_layers,
             num_attention_heads=config.heads,
             mlp_ratio=config.expansion,
-            hidden_act=config.hidden_act,
+            # A placeholder for HF's string-only schema; ``config.activation``
+            # replaces it on every layer below.
+            hidden_act="gelu",
             layer_norm_eps=config.eps,
             image_size=config.image_size,
             patch_size=config.patch_size,
@@ -334,11 +330,23 @@ class Dinov2WithRegisters(nn.Module):
             hidden_dropout_prob=0.0,
             attention_probs_dropout_prob=0.0,
             drop_path_rate=0.0,
-            attn_implementation=config.attn_implementation,
+            # The reference's ``from_pretrained`` resolves the fused ``"sdpa"``,
+            # which ``host_agnostic_numerics`` cannot reach inside; ``"eager"`` is
+            # the plain matmul-softmax sequence. Measured on the tiny parity
+            # fixture under ``host_agnostic_numerics``, the two differ in 6 of 64
+            # latent values by at most 3 float32 ULP.
+            attn_implementation="eager",
         )
         self.encoder: Dinov2WithRegistersModel = transformers.Dinov2WithRegistersModel(
             hf_config
         )
+        mlp_class = transformers.models.dinov2_with_registers.modeling_dinov2_with_registers.Dinov2WithRegistersMLP
+        for mlp in self.encoder.modules():
+            if isinstance(mlp, mlp_class):
+                # HF registered its ``GELUActivation`` as a child module; a plain
+                # function cannot overwrite a child, so the child goes first.
+                del mlp.activation
+                mlp.activation = config.activation
         if config.checkpoint is not None:
             state = load_file(str(config.checkpoint.make().path()))
             self.encoder.load_state_dict(state)
@@ -933,7 +941,11 @@ class RAE(nn.Module):
         Returns:
           latent: ``[B, channels_hidden, grid, grid]`` raw latent.
 
+        Raises:
+          TypeError: ``image`` is not uint8.
+
         """
+        require_uint8(image)
         pixels = rgb2float(image, float_dtype=torch.float32, unit_interval=True)
         _, _, height, width = pixels.shape
         side = self.encoder_image_size

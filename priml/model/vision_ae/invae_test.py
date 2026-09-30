@@ -3,6 +3,10 @@
 ``testdata/invae.pt`` was minted from the pre-protocol ``priml.model.invae``
 (``encode_image`` plus the inline decode) before the module moved; replaying it
 here is the proof that the move changed no arithmetic.
+
+Parity with REG's own ``models/invae.py`` is ``scripts/reference_parity.py``'s,
+not a golden's: REG hardcodes 32 GroupNorm groups, so the smallest model it
+builds is far over the 28,000-byte golden ceiling.
 """
 
 from __future__ import annotations
@@ -209,6 +213,13 @@ def test_published_cost_is_positive_and_linear_in_batch_size() -> None:
 
 def test_invae_config_pprint() -> None:
     assert_pprint_golden(test_file=__file__, name="invae_config", config=INVAE.Config())
+
+
+def test_encode_refuses_a_float_image() -> None:
+    """A ``[0, 1]`` float image would otherwise encode as near-black."""
+    model = tiny().make()
+    with pytest.raises(TypeError, match="uint8"):
+        _ = model.encode(torch.rand(1, 3, 16, 16))
 
 
 if __name__ == "__main__":

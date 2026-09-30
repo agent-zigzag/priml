@@ -17,11 +17,11 @@ from typing import TYPE_CHECKING, Protocol, runtime_checkable
 from configgle import Makeable
 from torch import Tensor
 
+import torch
+
 
 if TYPE_CHECKING:
     from pathlib import Path
-
-    import torch
 
 
 @runtime_checkable
@@ -51,6 +51,25 @@ class Autoencoder(Protocol):
 
         """
         ...
+
+
+def require_uint8(image: Tensor) -> None:
+    """Raise unless ``image`` meets ``Autoencoder.encode``'s uint8 contract.
+
+    Every encoder scales by 255 itself, so a float image already in ``[0, 1]``
+    would encode as near-black rather than fail.
+
+    Args:
+      image: The batch an encoder was handed.
+
+    Raises:
+      TypeError: ``image`` is not uint8.
+
+    """
+    if image.dtype != torch.uint8:
+        raise TypeError(
+            f"Autoencoders encode uint8 RGB in [0, 255]; got {image.dtype}.",
+        )
 
 
 @runtime_checkable
