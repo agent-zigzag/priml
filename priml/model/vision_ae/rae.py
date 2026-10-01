@@ -19,6 +19,9 @@ Deviations from the reference, each deliberate:
   the reference leaves clamping to its caller.
 - A latent grid the decoder was not built for raises; the reference silently
   resizes it bilinearly.
+- The CLS and register tokens dropped before the patches are counted from
+  ``num_register_tokens``; the reference hardcodes 5, the same count for every
+  published checkpoint.
 - Inference only: the decoder's dropouts (all ``p=0``), gradient
   checkpointing, attention outputs, and the ``drop_cls_token`` and
   ``interpolate_pos_encoding`` paths are not ported.
@@ -139,7 +142,7 @@ class Dinov2WithRegisters(nn.Module):
         """Side the position table was trained at; other sides interpolate it."""
 
         num_register_tokens: int = 4
-        """Register tokens inserted after CLS."""
+        """Register tokens inserted after CLS; both are dropped before the patches."""
 
         layerscale_value: float = 1.0
         """Initial LayerScale; the checkpoint overwrites it."""
@@ -152,13 +155,6 @@ class Dinov2WithRegisters(nn.Module):
 
         qkv_bias: bool = True
         """Whether the query, key, and value projections carry a bias."""
-
-        num_leading_tokens: int = 5
-        """Tokens dropped before the patches: CLS and four registers.
-
-        The reference hardcodes 5 rather than deriving it from
-        ``num_register_tokens``.
-        """
 
         pixel_mean: tuple[float, float, float] = (0.485, 0.456, 0.406)
         """ImageNet mean, from the checkpoint's ``preprocessor_config.json``."""
@@ -356,7 +352,9 @@ class Dinov2WithRegisters(nn.Module):
         layernorm.elementwise_affine = False
         layernorm.register_parameter("weight", None)
         layernorm.register_parameter("bias", None)
-        self.num_leading_tokens = config.num_leading_tokens
+        # CLS, then the registers: counted, not restated, so changing the register
+        # count cannot leave a register among the latent's patch tokens.
+        self.num_leading_tokens = 1 + config.num_register_tokens
 
     @override
     def forward(self, image: Tensor) -> Tensor:
