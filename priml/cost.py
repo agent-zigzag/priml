@@ -745,7 +745,10 @@ def reduction_cost(
 
 type Device = Literal[
     "a100",
+    "a100-40g",
+    "a100-80g-pcie",
     "h100",
+    "h100-pcie",
     "h200",
     "b200",
     "rtx5050",
@@ -760,12 +763,25 @@ type Device = Literal[
 # ``float32`` tensor entry is TF32, what a matmul runs at under
 # ``torch.backends.cuda.matmul.allow_tf32``.
 #
+# A bare name carries the form factor the entry above was sourced from, so
+# ``"a100"`` stays the 80GB SXM and ``"h100"`` stays SXM5. SXM parts move more
+# memory per second than the PCIe board of the same GPU, so naming the form is
+# what selects the right ridge: a bare name is the fastest member of the family,
+# and asking for a slower one is how you get the right answer for the card that
+# is actually in the machine.
+#
 # A100 80GB SXM: https://www.nvidia.com/en-us/data-center/a100/ "Specifications";
 #   the starred SXM column is "with sparsity", so each is halved (TF32 312 -> 156,
 #   BF16 624 -> 312, INT8 1248 -> 624). No FP8. FP64 TC 19.5; FP32 CUDA 19.5.
+# A100 40GB and A100 80GB PCIe: same die and the same tensor rates, 1.555 TB/s
+#   HBM2e (the 40GB part is HBM2, the 80GB PCIe part HBM2e, both 1.555 TB/s).
+#   Compute is unaffected by the form factor, so only the bandwidth differs.
 # H100 SXM5: NVIDIA H100 Tensor Core GPU datasheet, "no sparsity" column
 #   (FP64 TC 67 is not used; the vector rate is FP32 CUDA 67). Mirrored at
 #   https://www.spheron.network/blog/nvidia-h100-specs/ "Throughput by Precision".
+# H100 PCIe: same tensor rates, 2.0 TB/s HBM2e -- 60% of the SXM5 bandwidth.
+#   The intensity ridge therefore sits 1.68x higher on the PCIe board, which is
+#   enough to change which config reads as well tuned.
 # H200 SXM: same GH100 die and rates; 4.8 TB/s HBM3e from the same source.
 # B200: HGX B200 PCF summary (8 GPUs) divided by 8 --
 #   https://images.nvidia.com/aem-dam/Solutions/documents/HGX-B200-PCF-Summary.pdf
@@ -801,8 +817,43 @@ _DEVICES: Final[Mapping[Device, tuple[float, Mapping[torch.dtype, float], float]
         },
         19.5,
     ),
+    "a100-40g": (
+        1.555,
+        {
+            torch.float64: 19.5,
+            torch.float32: 156,
+            torch.bfloat16: 312,
+            torch.float16: 312,
+            torch.int8: 624,
+        },
+        19.5,
+    ),
+    "a100-80g-pcie": (
+        1.555,
+        {
+            torch.float64: 19.5,
+            torch.float32: 156,
+            torch.bfloat16: 312,
+            torch.float16: 312,
+            torch.int8: 624,
+        },
+        19.5,
+    ),
     "h100": (
         3.35,
+        {
+            torch.float64: 34,
+            torch.float32: 494,
+            torch.bfloat16: 989,
+            torch.float16: 989,
+            torch.float8_e4m3fn: 1979,
+            torch.float8_e5m2: 1979,
+            torch.int8: 1979,
+        },
+        67,
+    ),
+    "h100-pcie": (
+        2.0,
         {
             torch.float64: 34,
             torch.float32: 494,
@@ -908,6 +959,11 @@ def peak() -> Report:
 
     ``peak()["h100", torch.bfloat16]`` is one device at one dtype, measures by
     kernel. Sums across devices or dtypes rank alternatives and mean nothing.
+
+    A device name may name its form factor: ``"h100-pcie"`` and ``"a100-40g"``
+    price the board in the machine rather than the fastest member of the family.
+    A bare name is the SXM part for the datacenter GPUs, which is the form the
+    table was sourced from.
 
     Returns:
       peak: The floating datasheet table, owning nothing.
