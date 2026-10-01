@@ -176,7 +176,7 @@ def fit_sample_indices(num_records: int, num_images: int) -> list[int]:
     # A private generator: ``prepare`` seeds torch's global one for the encoder's
     # posterior draws, so a selection drawn from it would shift every latent after it.
     count = min(num_images, num_records)
-    return sorted(random.Random(FIT_SAMPLE_SEED).sample(range(num_records), count))
+    return sorted(random.Random(FIT_SAMPLE_SEED).sample(range(num_records), count))  # noqa: S311 -- This RNG only picks which images a codec is fitted on and never protects secrets.
 
 
 def prepare(
