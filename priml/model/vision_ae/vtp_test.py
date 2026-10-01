@@ -1,7 +1,7 @@
 """Tests for the VTP port.
 
 ``testdata/vtp.pt`` is this port's own golden: randomized weights, input, and
-output digests. ``testdata/vtp_reference.pt`` holds the reference's outputs for
+output, each stored whole. ``testdata/vtp_reference.pt`` holds the reference's outputs for
 those same weights and input, minted by ``scripts/reference_parity.py``
 running MiniMax-AI/VTP at commit 5ce1eb6 (its ``VTPModel.get_reconstruction_latents`` and
 ``get_latents_decoded_images``, with torchvision's ``ToTensor``, ``Normalize``,
