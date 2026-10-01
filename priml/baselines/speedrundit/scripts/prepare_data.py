@@ -24,12 +24,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol, cast
+from typing import TYPE_CHECKING, Final, Protocol, cast
 
 import argparse
 import hashlib
 import json
 import logging
+import random
 
 from PIL import Image
 
@@ -66,6 +67,13 @@ else:
 
 
 logger = logging.getLogger(__name__)
+
+FIT_SAMPLE_SEED: Final = 0
+"""Seeds the choice of a fitted codec's images; part of the table's identity.
+
+Changing it changes every table fitted after, which the receipt's
+``indices_sha256`` records; a table already on disk is reused, never refitted.
+"""
 
 
 def center_crop(image: Image.Image, size: int) -> Image.Image:
@@ -161,11 +169,14 @@ def fit_sample_indices(num_records: int, num_images: int) -> list[int]:
       num_images: How many the codec asks for; fewer if the corpus is smaller.
 
     Returns:
-      indices: Distinct, sorted positions in ``[0, num_records)``.
+      indices: Distinct, sorted positions in ``[0, num_records)``, a uniform
+        sample drawn with :data:`FIT_SAMPLE_SEED`.
 
     """
-    # TODO(human): choose the fit subset.
-    raise NotImplementedError
+    # A private generator: ``prepare`` seeds torch's global one for the encoder's
+    # posterior draws, so a selection drawn from it would shift every latent after it.
+    count = min(num_images, num_records)
+    return sorted(random.Random(FIT_SAMPLE_SEED).sample(range(num_records), count))
 
 
 def prepare(
