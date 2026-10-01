@@ -52,7 +52,6 @@ from priml.model import norm as priml_norm
 from priml.model.attention.kernel import attention_kernel_cost
 from priml.model.conv import conv_cost
 from priml.model.custom_types import ChannelsIn, TensorModule, propagate_attr
-from priml.model.swiglu import SwiGLU
 from priml.model.vision_ae.checkpoint import HubFile, UrlFile
 from priml.model.vision_ae.custom_types import (
     CheckpointFile,
