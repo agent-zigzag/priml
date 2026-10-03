@@ -153,5 +153,3 @@ wandb/
 # references the tests compare against); re-admit them past the *.pt rule.
 !**/testdata/
 !**/testdata/*.pt
-!**/testdata/**/*.npz
-!**/testdata/**/*.npy

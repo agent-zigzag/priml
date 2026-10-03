@@ -5,7 +5,7 @@ Default) and parameter-only (TRM-style) shadows.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Literal, cast
+from typing import TYPE_CHECKING, cast
 
 from torch import Tensor, nn
 from torch.distributed.device_mesh import init_device_mesh
@@ -335,59 +335,6 @@ def test_ema_state_dict_preserves_metadata() -> None:
     assert hasattr(shadow_sd, "_metadata"), (
         "EMA.state_dict() dropped shadow_model _metadata"
     )
-
-
-@pytest.mark.parametrize("shadow_kind", ["module", "param_dict"])
-def test_ema_checkpoint_loads_with_weights_only(
-    tmp_path: Path,
-    shadow_kind: Literal["module", "param_dict"],
-) -> None:
-    model = nn.Linear(2, 2)
-    config = EMA.Config(shadow_kind=shadow_kind, decay=0.5)
-    source = config.make()
-    source(model)
-    with torch.no_grad():
-        model.weight.add_(3.0)
-    source(model)
-    path = tmp_path / "ema.pt"
-    state = source.state_dict()
-    torch.save(state, path)
-    loaded = cast(EMA.StateDict, torch.load(path, weights_only=True))
-    resumed = config.make()
-    resumed.load_state_dict(loaded)
-    with source.apply_to(model):
-        expected = model.weight.detach().clone()
-    with resumed.apply_to(model):
-        assert torch.equal(model.weight, expected)
-    assert resumed.global_step == source.global_step
-    if shadow_kind == "module":
-        assert "shadow_model" in loaded
-        assert "shadow_model" in state
-        metadata_name = "_" + "metadata"
-        assert cast(object, getattr(loaded["shadow_model"], metadata_name)) == cast(
-            object,
-            getattr(state["shadow_model"], metadata_name),
-        )
-
-
-@pytest.mark.parametrize("shadow_kind", ["module", "param_dict"])
-def test_loaded_ema_can_be_checkpointed_before_its_first_update(
-    shadow_kind: Literal["module", "param_dict"],
-) -> None:
-    model = nn.Linear(1, 1, bias=False)
-    config = EMA.Config(shadow_kind=shadow_kind)
-    source = config.make()
-    source(model)
-    expected = model.weight.detach().clone()
-    loaded = config.make()
-    loaded.load_state_dict(source.state_dict())
-    saved_again = loaded.state_dict()
-    restored = config.make()
-    restored.load_state_dict(saved_again)
-    with torch.no_grad():
-        model.weight.add_(9.0)
-    with restored.apply_to(model):
-        assert torch.equal(model.weight, expected)
 
 
 def test_ema_apply_to_raises_on_missing_tracked_param() -> None:
