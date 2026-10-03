@@ -5,9 +5,6 @@ value residual attention, adaptive conditioning, sparse routing, and layerwise
 MLP width. The default configuration is the published SiT-B/1 run.
 """
 
-# PyTorch's module buffer and parameter stubs expose several values as Any.
-# pyright: reportAny=false
-
 from __future__ import annotations
 
 from functools import partial
@@ -421,6 +418,8 @@ class SpeedrunDiT(nn.Module):
         nn.init.zeros_(self.x_embedder.bias)
         nn.init.normal_(self.y_embedder.embedding_table.weight, std=0.02)
         for module in (self.t_embedder.mlp[0], self.t_embedder.mlp[2]):
+            if not isinstance(module, nn.Linear):
+                raise TypeError("Timestep embedding projections must be linear.")
             nn.init.normal_(module.weight, std=0.02)
         for block in self.blocks:
             nn.init.zeros_(block.adaLN_modulation[-1].weight)

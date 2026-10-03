@@ -8,9 +8,6 @@ never read as another's. Images live in one shared ``images/`` directory; each
 corpus's latents live in their own subdirectory beside it.
 """
 
-# NumPy's load return type is imprecise in its stubs.
-# pyright: reportAny=false
-
 from __future__ import annotations
 
 from dataclasses import field

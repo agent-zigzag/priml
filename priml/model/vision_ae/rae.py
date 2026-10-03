@@ -911,6 +911,7 @@ class RAE(nn.Module):
     def __init__(self, config: Config) -> None:
         super().__init__()
         self.encoder_image_size = config.encoder_image_size
+        self.latent_shape = config.latent_shape()
         # Encoder before decoder, as the reference registers them.
         self.encoder = config.encoder.make()
         self.encoder_mean: Tensor
@@ -978,6 +979,11 @@ class RAE(nn.Module):
 
         """
         batch, channels, height, width = latent.shape
+        if (channels, height, width) != self.latent_shape:
+            raise ValueError(
+                f"decoder built for {math.prod(self.latent_shape[1:])} latent tokens, "
+                f"got {height * width}; latent grid must have shape {self.latent_shape}.",
+            )
         tokens = latent.view(batch, channels, height * width).transpose(1, 2)
         pixels = self.decoder.unpatchify(self.decoder(tokens))
         return (pixels * self.encoder_std + self.encoder_mean).clamp(0, 1)

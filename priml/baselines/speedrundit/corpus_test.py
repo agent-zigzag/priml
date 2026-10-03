@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
@@ -17,14 +18,20 @@ from priml.baselines.speedrundit.corpus import (
     verify_receipt,
     write_receipt,
 )
-from priml.baselines.speedrundit.latent_codec import FloatCodec, ScalarTableCodec
+from priml.baselines.speedrundit.latent_codec import (
+    NUM_LEVELS,
+    FloatCodec,
+    ScalarTableCodec,
+)
 from priml.lib.custom_json import ListCodec
+from priml.model.vision_ae.custom_types import posterior_mode
 from priml.model.vision_ae.invae import INVAE
-from priml.model.vision_ae.rae import rae_dinov2_base
+from priml.model.vision_ae.latent_norm import ScaleLatents
+from priml.model.vision_ae.rae import RAE, rae_dinov2_base
 
 
 if TYPE_CHECKING:
-    from pathlib import Path
+    from typing import BinaryIO
 
 
 @pytest.mark.parametrize(
@@ -48,17 +55,60 @@ def test_a_file_of_another_dtype_is_refused(tmp_path: Path) -> None:
         _ = load_stored(path, torch.float16)
 
 
-def test_identity_collects_every_nested_checkpoint() -> None:
-    """RAE names its encoder, decoder, and statistics files: all three are pinned."""
+@pytest.mark.parametrize("value", [float("nan"), float("inf")])
+def test_non_finite_latents_are_refused_before_publication(
+    tmp_path: Path,
+    value: float,
+) -> None:
+    path = tmp_path / "latent.npy"
+    with pytest.raises(ValueError, match="finite"):
+        save_stored(path, torch.tensor([value]))
+    assert not path.exists()
+
+
+def test_identity_collects_only_encoding_checkpoints() -> None:
+    """Raw encoding depends on the encoder, independently of decoding and normalization."""
     identity = autoencoder_identity(rae_dinov2_base())
     files = ListCodec.mappings(identity["checkpoints"])
     names = {str(entry["filename"]) for entry in files}
     assert names == {
         "model.safetensors",
-        "decoders/dinov2/wReg_base/ViTXL_n08/model.pt",
-        "stats/dinov2/wReg_base/imagenet1k/stat.pt",
     }
     assert identity["latent_shape"] == [768, 16, 16]
+
+
+def test_encoding_policy_is_part_of_identity() -> None:
+    assert autoencoder_identity(INVAE.Config()) != autoencoder_identity(
+        INVAE.Config(latent_fn=posterior_mode),
+    )
+
+
+def test_normalization_and_decoding_do_not_change_raw_identity() -> None:
+    config = RAE.Config()
+    before = autoencoder_identity(config)
+    config.latent_norm = ScaleLatents.Config()
+    config.decoder.checkpoint = None
+    assert autoencoder_identity(config) == before
+
+
+def test_interrupted_save_does_not_publish_partial_latent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "latent.npy"
+    monkeypatch.setattr("priml.baselines.speedrundit.corpus.np.save", _interrupted_save)
+    with pytest.raises(OSError, match="interrupted"):
+        save_stored(path, torch.zeros(1))
+    assert not path.exists()
+
+
+def _interrupted_save(destination: Path | BinaryIO, array: object) -> None:
+    del array
+    if isinstance(destination, Path):
+        destination.write_bytes(b"\\x93NUMPY")
+    else:
+        destination.write(b"\\x93NUMPY")
+    raise OSError("interrupted")
 
 
 def test_a_matching_receipt_verifies(tmp_path: Path) -> None:
@@ -112,6 +162,13 @@ def test_a_table_is_pinned_by_its_digest(tmp_path: Path) -> None:
     restored = ScalarTableCodec.Config().make()
     assert load_table(tmp_path, restored) == digest
     assert torch.equal(restored.table()["levels"], codec.table()["levels"])
+
+
+def test_load_table_refuses_decreasing_persisted_levels(tmp_path: Path) -> None:
+    levels = torch.linspace(1, 0, NUM_LEVELS).unsqueeze(0)
+    torch.save({"levels": levels, "thresholds": levels[:, 1:]}, tmp_path / "codec.pt")
+    with pytest.raises(ValueError, match="non-decreasing"):
+        load_table(tmp_path, ScalarTableCodec.Config().make())
 
 
 def test_a_fitted_codec_without_its_table_is_refused(tmp_path: Path) -> None:

@@ -55,10 +55,14 @@ class SpeedrunTrainStep(TrainStep):
         ema: Makeable[EMAProtocol] = field(
             default_factory=lambda: cast(
                 Makeable[EMAProtocol],
-                EMA.Config(decay=0.9999, track_buffers=False),
+                EMA.Config(
+                    decay=0.9999,
+                    track_buffers=False,
+                    shadow_kind="param_dict",
+                ),
             ),
         )
-        """Exponential moving average of student parameters."""
+        """Parameter shadows support distributed models that cannot be copied."""
 
         gradient_clip_norm: float = 1.0
         """Global gradient norm clipping threshold."""

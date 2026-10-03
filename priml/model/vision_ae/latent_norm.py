@@ -18,6 +18,8 @@ from __future__ import annotations
 
 from typing import cast
 
+import math
+
 from configgle import Fig, Makeable
 from torch import Tensor
 
@@ -36,8 +38,8 @@ class ScaleLatents:
         """Multiplier into diffusion space; INVAE publishes 0.3099."""
 
     def __init__(self, config: Config) -> None:
-        if config.scale == 0:
-            raise ValueError("ScaleLatents needs a nonzero scale.")
+        if not math.isfinite(config.scale) or config.scale == 0:
+            raise ValueError("ScaleLatents needs a finite nonzero scale.")
         self.scale = config.scale
 
     def normalize(self, latent: Tensor, /) -> Tensor:
@@ -158,6 +160,8 @@ class ChannelLatentStats:
         """Applied after standardizing; VTP's configs set 1.0."""
 
     def __init__(self, config: Config) -> None:
+        if not math.isfinite(config.multiplier) or config.multiplier == 0:
+            raise ValueError("ChannelLatentStats needs a finite nonzero multiplier.")
         if config.stats is None:
             raise ValueError("ChannelLatentStats needs a stats file.")
         payload = cast(

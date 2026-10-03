@@ -74,6 +74,11 @@ def tiny() -> RAE.Config:
 
 # A private generator: the harness reseeds the global one before building the module,
 # and replay loads the stored input rather than rebuilding it.
+def test_decode_refuses_rectangular_grid_with_matching_token_count() -> None:
+    with pytest.raises(ValueError, match="grid"):
+        tiny().make().decode(torch.zeros(1, 8, 1, 4))
+
+
 def _image() -> Tensor:
     """Return a uint8 image batch larger than the encoder side."""
     generator = torch.Generator().manual_seed(0)

@@ -68,15 +68,13 @@ def lloyd_max(
       levels: ``[len(init)]`` float64, non-decreasing; sums run in float64.
 
     Raises:
-      ValueError: ``values`` is empty or not finite, or ``init`` is empty.
+      ValueError: ``values`` or ``init`` is empty or not one-dimensional.
 
     """
     if values.ndim != 1 or init.ndim != 1:
         raise ValueError("lloyd_max expects 1-D values and levels.")
     if values.numel() == 0 or init.numel() == 0:
         raise ValueError("lloyd_max needs a nonempty sample and at least one level.")
-    if not bool(torch.isfinite(values).all()):
-        raise ValueError("lloyd_max needs finite values.")
     x = values.detach().to(torch.float64).sort().values
     num_levels = init.numel()
     distinct = cast("Tensor", torch.unique_consecutive(x))  # pyright: ignore[reportAny] -- torch stubs type unique_consecutive as Any.
@@ -86,7 +84,7 @@ def lloyd_max(
     zero = x.new_zeros(1)
     total = torch.cat([zero, x.cumsum(0)])
     total_sq = torch.cat([zero, (x * x).cumsum(0)])
-    levels = init.detach().to(torch.float64).sort().values
+    levels = init.detach().to(device=x.device, dtype=torch.float64).sort().values
     previous = _distortion(x, levels, total, total_sq)
     for _ in range(max_iterations):
         bounds = _cell_bounds(x, levels)
@@ -141,23 +139,27 @@ def high_resolution_levels(
       levels: ``[num_levels]`` float64, non-decreasing.
 
     Raises:
-      ValueError: ``values`` is empty or not finite.
+      ValueError: ``values`` is empty or not one-dimensional.
 
     """
     if values.ndim != 1 or values.numel() == 0:
         raise ValueError("high_resolution_levels expects a nonempty 1-D sample.")
-    if not bool(torch.isfinite(values).all()):
-        raise ValueError("high_resolution_levels needs finite values.")
     x = values.detach().to(torch.float64)
     low, high = float(x.min()), float(x.max())
     if low == high:
         return x.new_full((num_levels,), low)
     bins = math.isqrt(x.numel()) if bins is None else bins
-    edges = torch.linspace(low, high, bins + 1, dtype=torch.float64)
-    counts = torch.histc(x, bins=bins, min=low, max=high)
+    edges = torch.linspace(low, high, bins + 1, dtype=torch.float64, device=x.device)
+    # CUDA histc has no deterministic implementation; this offline fit can use CPU.
+    histogram_sample = (
+        x.cpu() if x.is_cuda and torch.are_deterministic_algorithms_enabled() else x
+    )
+    counts = torch.histc(histogram_sample, bins=bins, min=low, max=high).to(x.device)
     density = torch.cat([x.new_zeros(1), (counts ** (1 / 3)).cumsum(0)])
     density = density / density[-1]
-    target = (torch.arange(num_levels, dtype=torch.float64) + 0.5) / num_levels
+    target = (
+        torch.arange(num_levels, dtype=torch.float64, device=x.device) + 0.5
+    ) / num_levels
     upper = torch.searchsorted(density, target).clamp(1, bins)
     below, above = density[upper - 1], density[upper]
     fraction = (target - below) / (above - below)
@@ -220,13 +222,11 @@ def quantize(values: Tensor, thresholds: Tensor) -> Tensor:
     Returns:
       indices: ``[R, M]`` int64 in ``[0, L - 1]``.
 
-    Raises:
-      ValueError: A value is not finite.
-
     """
-    if not bool(torch.isfinite(values).all()):
-        raise ValueError("quantize needs finite values.")
-    return torch.searchsorted(thresholds.contiguous(), values.contiguous())
+    return torch.searchsorted(
+        thresholds.to(values.device).contiguous(),
+        values.contiguous(),
+    )
 
 
 def dequantize(indices: Tensor, levels: Tensor) -> Tensor:
@@ -240,7 +240,7 @@ def dequantize(indices: Tensor, levels: Tensor) -> Tensor:
       values: ``[R, M]`` in ``levels``' dtype.
 
     """
-    return torch.gather(levels, 1, indices.long())
+    return torch.gather(levels.to(indices.device), 1, indices.long())
 
 
 # Cell k holds the samples at or below boundary k and above boundary k-1, matching

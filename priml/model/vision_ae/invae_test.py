@@ -38,7 +38,7 @@ from priml.model.vision_ae.invae import (
 )
 from priml.model.vision_ae.latent_norm import ScaleLatents
 from priml.testing.bfb import assert_bfb_against_golden
-from priml.testing.cost import assert_cost_matches_torch
+from priml.testing.cost import assert_cost_matches_torch, measured_traffic
 
 
 _CWD: Final = Path(__file__).resolve().parent
@@ -109,6 +109,19 @@ def test_mode_latent_is_the_posterior_mean() -> None:
     config.latent_fn = posterior_mode
     model = config.make()
     assert torch.equal(model.encode(_image()), model.posterior(_image()).mean)
+
+
+def test_mode_cost_removes_exactly_the_measured_sampling_traffic() -> None:
+    sampled, modal = tiny(), tiny()
+    modal.latent_fn = posterior_mode
+    sampled_bytes = measured_traffic(sampled, build_input=_image, run=_encode_decode)
+    modal_bytes = measured_traffic(modal, build_input=_image, run=_encode_decode)
+    measured_delta = sampled_bytes["elementwise"] - modal_bytes["elementwise"]
+    analytical_delta = (
+        cost(sampled, batch_size=1, dtype=None)["bytes", "elementwise"].sum()
+        - cost(modal, batch_size=1, dtype=None)["bytes", "elementwise"].sum()
+    )
+    assert measured_delta == analytical_delta
 
 
 def test_sample_draws_from_an_explicit_generator() -> None:

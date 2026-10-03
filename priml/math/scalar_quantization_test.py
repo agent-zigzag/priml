@@ -23,6 +23,27 @@ def _snr_db(values: torch.Tensor, levels: torch.Tensor) -> float:
     return 10 * math.log10(float(values.var()) / noise)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
+@pytest.mark.parametrize("deterministic", [False, True])
+def test_cuda_sample_can_be_fitted_and_coded_with_cpu_initial_levels(
+    deterministic: bool,
+) -> None:
+    previous = torch.are_deterministic_algorithms_enabled()
+    warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    try:
+        torch.use_deterministic_algorithms(deterministic)
+        values = torch.randn(512, device="cuda")
+        initial = high_resolution_levels(values, 8)
+        assert initial.device == values.device
+        levels = lloyd_max(values, initial.cpu())
+        assert levels.device == values.device
+        indices = quantize(values[None], midpoints(levels.cpu())[None])
+        assert dequantize(indices, levels.cpu()[None]).device == values.device
+        assert torch.are_deterministic_algorithms_enabled() == deterministic
+    finally:
+        torch.use_deterministic_algorithms(previous, warn_only=warn_only)
+
+
 def test_gaussian_levels_reproduce_max_1960_table_for_four_levels() -> None:
     """Max (1960), Table I, N = 4: outputs 0.4528, 1.510; boundary 0.9816."""
     levels = gaussian_levels(4, num_points=1 << 16)
@@ -88,10 +109,10 @@ def test_fewer_distinct_values_than_levels_returns_the_values() -> None:
     assert lloyd_max(values, torch.zeros(4)).tolist() == [1.0, 2.0, 3.0, 3.0]
 
 
-def test_rejects_non_finite_samples() -> None:
-    with pytest.raises(ValueError, match="finite"):
-        _ = lloyd_max(torch.tensor([0.0, math.nan]), torch.zeros(2))
-    with pytest.raises(ValueError, match="finite"):
+def test_non_finite_samples_propagate_or_are_refused_by_the_leaf() -> None:
+    levels = lloyd_max(torch.tensor([0.0, math.nan]), torch.zeros(2))
+    assert levels.isnan().any()
+    with pytest.raises(RuntimeError):
         _ = high_resolution_levels(torch.tensor([0.0, math.inf]), 2)
 
 
@@ -127,17 +148,19 @@ def test_ties_take_the_lower_cell_and_outliers_saturate() -> None:
     assert quantize(values, thresholds).tolist() == [[0, 0, 1, 1, 2, 2]]
 
 
+def test_quantize_compiles_without_reading_a_python_scalar() -> None:
+    values = torch.tensor([[-1.0, 0.0, 1.0]])
+    thresholds = torch.tensor([[0.0]])
+    compiled = torch.compile(quantize, backend="eager", fullgraph=True)
+    assert torch.equal(compiled(values, thresholds), quantize(values, thresholds))
+
+
 def test_quantize_and_dequantize_apply_one_table_per_row() -> None:
     levels = torch.tensor([[0.0, 1.0, 2.0], [10.0, 20.0, 30.0]])
     values = torch.tensor([[0.2, 1.9, 1.4], [11.0, 26.0, 99.0]])
     indices = quantize(values, midpoints(levels))
     assert indices.tolist() == [[0, 2, 1], [0, 2, 2]]
     assert dequantize(indices, levels).tolist() == [[0.0, 2.0, 1.0], [10.0, 30.0, 30.0]]
-
-
-def test_quantize_rejects_non_finite_values() -> None:
-    with pytest.raises(ValueError, match="finite"):
-        _ = quantize(torch.tensor([[math.nan]]), torch.tensor([[0.0]]))
 
 
 if __name__ == "__main__":

@@ -22,6 +22,7 @@ Examples:
 
 from __future__ import annotations
 
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, cast
 
@@ -29,6 +30,7 @@ import argparse
 import json
 import logging
 import math
+import random
 
 from priml.baselines.speedrundit.latent_codec import (
     FittedCodec,
@@ -43,9 +45,11 @@ from priml.baselines.speedrundit.latent_codec import (
     entropy_bits,
 )
 from priml.baselines.speedrundit.scripts.prepare_data import (
+    FIT_SAMPLE_SEED,
     batches,
     dataset_config,
     encode_latents,
+    ensure_image_source,
     fit_sample_indices,
     records,
 )
@@ -57,6 +61,7 @@ if TYPE_CHECKING:
     from configgle import Makeable
     from torch import Tensor
 
+    import lpips
     import torch
 
     from priml.baselines.speedrundit.latent_codec import LatentCodec
@@ -66,6 +71,7 @@ else:
     from wrapt import lazy_import
 
     torch = lazy_import("torch")
+    lpips = lazy_import("lpips")
 
 
 logger = logging.getLogger(__name__)
@@ -235,6 +241,11 @@ def run(
 ) -> dict[str, object]:
     """Encode both samples with the experiment's autoencoder and score every codec.
 
+    Both samples remain in CPU memory. Their size depends on the requested
+    image counts, while ``batch_size`` controls encoding device memory. Each
+    float32 RAE latent (768 x 16 x 16) occupies 768 KiB, before fitting and
+    metric temporaries; choose image counts that fit the available host RAM.
+
     Args:
       experiment: Factory in :mod:`~priml.baselines.speedrundit.experiments`.
       imagenet: Extracted ImageNet directory.
@@ -252,8 +263,17 @@ def run(
     root = Path(config.working_dir)
     listed = records(imagenet)
     chosen = fit_sample_indices(len(listed), num_fit_images + num_eval_images)
-    fit_records = [listed[i] for i in chosen[0::2][:num_fit_images]]
-    eval_records = [listed[i] for i in chosen[1::2][:num_eval_images]]
+    if num_fit_images < 1 or num_eval_images < 1:
+        raise ValueError("Fitting and evaluation image counts must be positive.")
+    if len(chosen) != num_fit_images + num_eval_images:
+        raise ValueError(
+            "The corpus is too small for disjoint fitting and evaluation sets.",
+        )
+    ensure_image_source(root, imagenet, listed, config.autoencoder.image_size)
+    # Shuffle before partitioning: the source order is grouped by ImageNet class.
+    random.Random(FIT_SAMPLE_SEED).shuffle(chosen)  # noqa: S311 -- Selects benchmark images, not secrets.
+    fit_records = [listed[i] for i in chosen[:num_fit_images]]
+    eval_records = [listed[i] for i in chosen[num_fit_images:]]
     autoencoder = config.autoencoder.make()
     if isinstance(autoencoder, torch.nn.Module):
         _ = autoencoder.to(device)
@@ -360,38 +380,61 @@ def _decoder(
     batch_size: int,
 ) -> Callable[[Tensor], Tensor]:
     """Return raw latents to CPU ``[0, 1]`` images, decoded in batches."""
+    return partial(
+        _decode,
+        autoencoder=autoencoder,
+        device=device,
+        batch_size=batch_size,
+    )
 
-    def decode(latents: Tensor) -> Tensor:
-        with torch.inference_mode():
-            return torch.cat(
-                [
-                    autoencoder.decode(chunk.to(device)).float().cpu()
-                    for chunk in latents.split(batch_size)
-                ],
-            )
 
-    return decode
+def _decode(
+    latents: Tensor,
+    *,
+    autoencoder: Autoencoder,
+    device: str,
+    batch_size: int,
+) -> Tensor:
+    """Decode raw latents to CPU images in bounded batches."""
+    with torch.inference_mode():
+        return torch.cat(
+            [
+                autoencoder.decode(chunk.to(device)).float().cpu()
+                for chunk in latents.split(batch_size)
+            ],
+        )
 
 
 def _lpips(device: str, batch_size: int) -> Callable[[Tensor, Tensor], float]:
-    """Return the mean AlexNet LPIPS between two ``[0, 1]`` image batches."""
-    import lpips  # noqa: PLC0415 -- Loaded, with its weight download, only when images are scored.
-
+    """Return the mean AlexNet LPIPS between two image batches."""
     network = lpips.LPIPS(net="alex", verbose=False).to(device).eval()
+    return partial(
+        _lpips_distance,
+        network=network,
+        device=device,
+        batch_size=batch_size,
+    )
 
-    def distance(reference: Tensor, other: Tensor) -> float:
-        scores: list[Tensor] = []
-        with torch.inference_mode():
-            for left, right in zip(
-                reference.split(batch_size),
-                other.split(batch_size),
-                strict=True,
-            ):
-                pair = (left.to(device) * 2 - 1, right.to(device) * 2 - 1)
-                scores.append(network(*pair).flatten().cpu())
-        return float(torch.cat(scores).double().mean())
 
-    return distance
+def _lpips_distance(
+    reference: Tensor,
+    other: Tensor,
+    *,
+    network: lpips.LPIPS,
+    device: str,
+    batch_size: int,
+) -> float:
+    """Measure mean perceptual distance in bounded batches."""
+    scores: list[Tensor] = []
+    with torch.inference_mode():
+        for left, right in zip(
+            reference.split(batch_size),
+            other.split(batch_size),
+            strict=True,
+        ):
+            pair = (left.to(device) * 2 - 1, right.to(device) * 2 - 1)
+            scores.append(network(*pair).flatten().cpu())
+    return float(torch.cat(scores).double().mean())
 
 
 def _add_arguments(parser: argparse.ArgumentParser) -> None:

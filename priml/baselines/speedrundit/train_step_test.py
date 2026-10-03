@@ -7,9 +7,11 @@ from typing import Final, override
 
 from configgle import Fig
 from torch import Tensor, nn
+from torch.distributed._composable.replicate import replicate
 
 import pytest
 import torch
+import torch.distributed as dist
 
 from priml.baselines.speedrundit.experiments import exp_smoke
 from priml.baselines.speedrundit.model_test import tiny_model
@@ -78,6 +80,28 @@ def test_train_step_updates_model_and_advances_budget() -> None:
     assert step.global_step == 1
     assert result["loss"].shape == (5,)
     assert torch.isfinite(result["loss"]).all()
+
+
+def test_default_ema_supports_replicated_models(tmp_path: Path) -> None:
+    dist.init_process_group(
+        backend="gloo",
+        init_method=(tmp_path / "ema-rendezvous").resolve().as_uri(),
+        rank=0,
+        world_size=1,
+    )
+    try:
+        model = nn.Linear(2, 2)
+        replicate(model)
+        ema = SpeedrunTrainStep.Config().ema.make()
+        ema(model)
+        expected = model.weight.detach().clone()
+        with torch.no_grad():
+            model.weight.add_(1)
+        with ema.apply_to(model):
+            assert torch.equal(model.weight, expected)
+        assert torch.equal(model.weight, expected + 1)
+    finally:
+        dist.destroy_process_group()
 
 
 def test_accumulation_averages_micro_batch_gradients_before_stepping(

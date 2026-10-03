@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from functools import partial
 from typing import TYPE_CHECKING, Literal, Protocol, Self
 
 from torch import Tensor
@@ -150,66 +151,97 @@ def sample_latents(
         if shift_time:
             t_steps = time_shift(t_steps, latents[0].numel(), shift_base)
 
-        def drift(x: Tensor, cls: Tensor, t_cur: Tensor) -> tuple[Tensor, Tensor]:
-            t = t_cur.expand(x.shape[0])
-            use_cfg = cfg_scale > 1 and guidance_low <= t_cur <= guidance_high
-            cond = _predict(
-                model,
-                x,
-                cls,
-                t,
-                labels,
-                latent_dtype=latents.dtype,
-                cls_dtype=cls_latents.dtype,
-                drop_path=False,
-            )
-            score_x = score_from_velocity(cond.velocity.double(), x, t, path)
-            score_cls = score_from_velocity(cond.cls_velocity.double(), cls, t, path)
-            diffusion = repa_diffusion(t_cur)
-            drift_x = velocity_to_drift(cond.velocity.double(), score_x, diffusion)
-            drift_cls = velocity_to_drift(
-                cond.cls_velocity.double(),
-                score_cls,
-                diffusion,
-            )
-            if use_cfg:
-                null = torch.full_like(labels, model.config.num_classes)
-                uncond = _predict(
-                    model,
-                    x,
-                    cls,
-                    t,
-                    null,
-                    latent_dtype=latents.dtype,
-                    cls_dtype=cls_latents.dtype,
-                    drop_path=path_drop_guidance,
-                )
-                score_u = score_from_velocity(uncond.velocity.double(), x, t, path)
-                score_cls_u = score_from_velocity(
-                    uncond.cls_velocity.double(),
-                    cls,
-                    t,
-                    path,
-                )
-                drift_u = velocity_to_drift(
-                    uncond.velocity.double(),
-                    score_u,
-                    diffusion,
-                )
-                drift_cls_u = velocity_to_drift(
-                    uncond.cls_velocity.double(),
-                    score_cls_u,
-                    diffusion,
-                )
-                drift_x = guide_drift(drift_x, drift_u, cfg_scale)
-                if cls_cfg_scale > 0:
-                    drift_cls = guide_drift(drift_cls, drift_cls_u, cls_cfg_scale)
-            return drift_x, drift_cls
+        drift = partial(
+            _drift,
+            model=model,
+            labels=labels,
+            latent_dtype=latents.dtype,
+            cls_dtype=cls_latents.dtype,
+            cfg_scale=cfg_scale,
+            cls_cfg_scale=cls_cfg_scale,
+            path=path,
+            path_drop_guidance=path_drop_guidance,
+            guidance_low=guidance_low,
+            guidance_high=guidance_high,
+        )
 
         x, cls = integrate_two_streams(latents, cls_latents, t_steps, drift)
         return x.to(latents.dtype), cls.to(cls_latents.dtype)
     finally:
         model.train(was_training)
+
+
+def _drift(
+    x: Tensor,
+    cls: Tensor,
+    t_cur: Tensor,
+    *,
+    model: SamplerModel,
+    labels: Tensor,
+    latent_dtype: torch.dtype,
+    cls_dtype: torch.dtype,
+    cfg_scale: float,
+    cls_cfg_scale: float,
+    path: Literal["linear", "cosine"],
+    path_drop_guidance: bool,
+    guidance_low: float,
+    guidance_high: float,
+) -> tuple[Tensor, Tensor]:
+    """Return both SDE drifts under the requested guidance policy."""
+    t = t_cur.expand(x.shape[0])
+    use_cfg = cfg_scale > 1 and guidance_low <= t_cur <= guidance_high
+    cond = _predict(
+        model,
+        x,
+        cls,
+        t,
+        labels,
+        latent_dtype=latent_dtype,
+        cls_dtype=cls_dtype,
+        drop_path=False,
+    )
+    score_x = score_from_velocity(cond.velocity.double(), x, t, path)
+    score_cls = score_from_velocity(cond.cls_velocity.double(), cls, t, path)
+    diffusion = repa_diffusion(t_cur)
+    drift_x = velocity_to_drift(cond.velocity.double(), score_x, diffusion)
+    drift_cls = velocity_to_drift(
+        cond.cls_velocity.double(),
+        score_cls,
+        diffusion,
+    )
+    if use_cfg:
+        null = torch.full_like(labels, model.config.num_classes)
+        uncond = _predict(
+            model,
+            x,
+            cls,
+            t,
+            null,
+            latent_dtype=latent_dtype,
+            cls_dtype=cls_dtype,
+            drop_path=path_drop_guidance,
+        )
+        score_u = score_from_velocity(uncond.velocity.double(), x, t, path)
+        score_cls_u = score_from_velocity(
+            uncond.cls_velocity.double(),
+            cls,
+            t,
+            path,
+        )
+        drift_u = velocity_to_drift(
+            uncond.velocity.double(),
+            score_u,
+            diffusion,
+        )
+        drift_cls_u = velocity_to_drift(
+            uncond.cls_velocity.double(),
+            score_cls_u,
+            diffusion,
+        )
+        drift_x = guide_drift(drift_x, drift_u, cfg_scale)
+        if cls_cfg_scale > 0:
+            drift_cls = guide_drift(drift_cls, drift_cls_u, cls_cfg_scale)
+    return drift_x, drift_cls
 
 
 def _predict(

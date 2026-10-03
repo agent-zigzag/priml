@@ -385,13 +385,17 @@ def test_vtp_large_config_pprint() -> None:
 @pytest.mark.network_github
 @pytest.mark.compute_large_fixture
 def test_published_large_checkpoint_round_trips() -> None:
-    """Download VTP-Large, load it strictly, and reconstruct a flat gray image."""
+    """Reconstruct gray at the published checkpoint's trained resolution."""
     config = vtp_large()
     model = config.make()
     norm = config.latent_norm.make()
-    image = torch.full((1, 3, 32, 32), 128, dtype=torch.uint8)
+    image = torch.full(
+        (1, 3, config.image_size, config.image_size),
+        128,
+        dtype=torch.uint8,
+    )
     latent = model.encode(image)
-    assert latent.shape == (1, 64, 2, 2)
+    assert latent.shape == (1, *config.latent_shape())
     assert torch.isfinite(norm.normalize(latent)).all()
     decoded = model.decode(latent)
     assert (decoded - 128 / 255).abs().mean() < 0.05

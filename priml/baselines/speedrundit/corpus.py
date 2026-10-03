@@ -50,7 +50,7 @@ CODEC_TABLE: Final = "codec.pt"
 LABELS: Final = "dataset.json"
 """The REG label manifest, beside the receipt."""
 
-FORMAT_VERSION: Final = 1
+FORMAT_VERSION: Final = 2
 """Bumped when the receipt's schema changes meaning."""
 
 
@@ -70,9 +70,14 @@ def save_stored(path: Path, stored: Tensor) -> None:
 
     """
     tensor = stored.detach().cpu().contiguous()
+    if tensor.is_floating_point() and not np.isfinite(tensor.float().numpy()).all():
+        raise ValueError("Stored latents must be finite; the codec dtype overflowed.")
     if tensor.dtype == torch.bfloat16:
         tensor = tensor.view(torch.int16)
-    np.save(path, tensor.numpy())
+    staging = path.with_suffix(".npy.partial")
+    with staging.open("wb") as stream:
+        np.save(stream, tensor.numpy())
+    staging.replace(path)
 
 
 def load_stored(path: Path, dtype: torch.dtype) -> Tensor:
@@ -105,13 +110,14 @@ def autoencoder_identity(config: VisionAutoencoderConfig) -> dict[str, object]:
       config: The experiment's autoencoder config.
 
     Returns:
-      identity: Class, latent shape, and every checkpoint file's identity.
+      identity: Encoding configuration, shape, and encoding checkpoints.
 
     """
     return {
         "class": _qualified(config),
         "latent_shape": list(config.latent_shape()),
         "checkpoints": [file.identity() for file in _checkpoint_files(config)],
+        "encoding": _encoding_identity(config),
     }
 
 
@@ -164,7 +170,9 @@ def save_table(directory: Path, codec: FittedCodec) -> str:
     """
     path = table_path(directory)
     staging = path.with_suffix(".pt.partial")
-    torch.save(codec.table(), staging)
+    table = {name: value.detach().cpu() for name, value in codec.table().items()}
+    _audit_table(table)
+    torch.save(table, staging)
     staging.replace(path)
     return _sha256(path)
 
@@ -193,7 +201,17 @@ def load_table(directory: Path, codec: FittedCodec) -> str:
         torch.load(path, map_location="cpu", weights_only=True),
     )
     codec.load_table(table)
+    _audit_table(table)
     return _sha256(path)
+
+
+def _audit_table(table: Mapping[str, Tensor]) -> None:
+    """Audit CPU artifact values once, outside reusable device kernels."""
+    arrays = {name: value.numpy() for name, value in table.items()}
+    if any(not np.isfinite(value).all() for value in arrays.values()):
+        raise ValueError("Codec tables must contain finite values.")
+    if not (np.diff(arrays["levels"], axis=-1) >= 0).all():
+        raise ValueError("Codec levels must be non-decreasing in every row.")
 
 
 def write_receipt(
@@ -303,10 +321,33 @@ def _qualified(config: object) -> str:
     return f"{made.__module__}.{made.__qualname__}"
 
 
-# A checkpoint is found by what it makes, not by name, so an autoencoder wrapping
-# several (RAE's encoder, decoder, and statistics) reports all of them.
+# Decode-only modules and diffusion normalization never produce raw latent bytes.
+_DECODE_FIELDS: Final = frozenset({"decoder", "pixel_decoder", "latent_norm"})
+
+
+def _encoding_identity(config: object) -> object:
+    """Describe encoding inputs without machine-specific checkpoint locations."""
+    made = getattr(type(config), "parent_class", None)
+    if isinstance(made, type) and issubclass(made, CheckpointFile):
+        return cast("Makeable[CheckpointFile]", config).make().identity()
+    if is_dataclass(config) and not isinstance(config, type):
+        return {
+            "class": _qualified(config),
+            **{
+                entry.name: _encoding_identity(
+                    cast("object", getattr(config, entry.name)),
+                )
+                for entry in fields(config)
+                if entry.name not in _DECODE_FIELDS
+            },
+        }
+    if isinstance(config, list | tuple):
+        return [_encoding_identity(item) for item in cast("list[object]", config)]
+    return pformat(config, hide_default_values=False)
+
+
 def _checkpoint_files(config: object) -> list[CheckpointFile]:
-    """Return every checkpoint file reachable in a config tree, in field order."""
+    """Return encoding checkpoints reachable in a config tree, in field order."""
     found: list[CheckpointFile] = []
     made = getattr(type(config), "parent_class", None)
     if isinstance(made, type) and issubclass(made, CheckpointFile):
@@ -314,7 +355,8 @@ def _checkpoint_files(config: object) -> list[CheckpointFile]:
         return [built]
     if is_dataclass(config) and not isinstance(config, type):
         for entry in fields(config):
-            found += _checkpoint_files(getattr(config, entry.name))  # pyright: ignore[reportAny] -- Dataclass fields are read by name.
+            if entry.name not in _DECODE_FIELDS:
+                found += _checkpoint_files(getattr(config, entry.name))  # pyright: ignore[reportAny] -- Dataclass fields are read by name.
     elif isinstance(config, list | tuple):
         for item in cast("list[object]", config):
             found += _checkpoint_files(item)

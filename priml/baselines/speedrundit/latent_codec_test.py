@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import math
-
 from torch import Tensor
 
 import pytest
@@ -44,6 +42,34 @@ def _mse_per_channel(codec: LatentCodec, latent: Tensor) -> Tensor:
     return error.pow(2).mean(dim=(0, 2, 3))
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
+@pytest.mark.parametrize(
+    "fit",
+    [LloydMaxFit.Config, GaussianFit.Config, QuantileFit.Config, LinearFit.Config],
+)
+@pytest.mark.parametrize("groups", [SharedTable.Config, ScaleGroups.Config])
+def test_fitted_codecs_preserve_cuda_device(
+    fit: type[
+        LloydMaxFit.Config | GaussianFit.Config | QuantileFit.Config | LinearFit.Config
+    ],
+    groups: type[SharedTable.Config | ScaleGroups.Config],
+) -> None:
+    sample = _sample(images=4).cuda()
+    codec = _fitted(ScalarTableCodec.Config(fit=fit(), groups=groups()), sample)
+    stored = codec.encode(sample)
+    assert stored.device == sample.device
+    assert codec.decode(stored).device == sample.device
+    assert codec.saturated(sample).device == sample.device
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
+def test_cpu_codec_table_can_code_cuda_inputs() -> None:
+    codec = _fitted(ScalarTableCodec.Config(), _sample(images=4))
+    sample = _sample(images=4).cuda()
+    assert codec.decode(codec.encode(sample)).device == sample.device
+    assert codec.saturated(sample).device == sample.device
+
+
 def test_float32_codec_is_the_identity() -> None:
     codec = FloatCodec.Config().make()
     latent = _sample()
@@ -59,10 +85,16 @@ def test_float16_codec_rounds_to_half_and_widens_back() -> None:
     assert torch.equal(codec.decode(stored), latent.half().float())
 
 
-def test_float_codec_refuses_a_value_that_overflows() -> None:
+def test_float_encoding_compiles_without_reading_a_python_scalar() -> None:
     codec = FloatCodec.Config(dtype=torch.float16).make()
-    with pytest.raises(ValueError, match="does not fit"):
-        _ = codec.encode(torch.tensor([1e6]))
+    latent = _sample(images=1)
+    compiled = torch.compile(codec.encode, backend="eager", fullgraph=True)
+    assert torch.equal(compiled(latent), codec.encode(latent))
+
+
+def test_float_codec_preserves_the_floating_overflow_contract() -> None:
+    codec = FloatCodec.Config(dtype=torch.float16).make()
+    assert codec.encode(torch.tensor([1e6])).isinf().all()
 
 
 def test_float_codec_needs_a_floating_dtype() -> None:
@@ -196,19 +228,11 @@ def test_unfitted_codec_refuses_to_encode() -> None:
         _ = ScalarTableCodec.Config().make().encode(_sample())
 
 
-def test_load_table_rejects_decreasing_levels() -> None:
-    levels = torch.linspace(1, 0, NUM_LEVELS).unsqueeze(0)
-    with pytest.raises(ValueError, match="non-decreasing"):
-        ScalarTableCodec.Config().make().load_table(
-            {"levels": levels, "thresholds": levels[:, 1:]},
-        )
-
-
-def test_encode_rejects_non_finite_latents() -> None:
+def test_table_encoding_compiles_without_reading_a_python_scalar() -> None:
     codec = _fitted(ScalarTableCodec.Config(), _sample())
-    latent = torch.full((1, 2, 1, 1), math.nan)
-    with pytest.raises(ValueError, match="finite"):
-        _ = codec.encode(latent)
+    latent = _sample(images=1)
+    compiled = torch.compile(codec.encode, backend="eager", fullgraph=True)
+    assert torch.equal(compiled(latent), codec.encode(latent))
 
 
 def test_entropy_of_uniform_indices_is_eight_bits() -> None:

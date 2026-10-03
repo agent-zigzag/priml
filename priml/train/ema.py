@@ -266,7 +266,7 @@ class EMA:
         self._shadow_buffers: dict[str, Tensor] = {}
         self.global_step = 0
         self.local_step = 0
-        self._pending_state: _StateDict | None = None
+        self._pending_state: OrderedDict[str, Tensor] | None = None
         self._tracked_names: set[str] = set()
         self._backup: dict[str, Tensor] = {}
         self._initialized = False
@@ -415,7 +415,13 @@ class EMA:
             ``state_dict`` for versioned load.
 
         """
-        if not self._initialized:
+        if self._pending_state is not None:
+            return {
+                "shadow_model": _clone_module_state(self._pending_state),
+                "global_step": self.global_step,
+                "local_step": self.local_step,
+            }
+        if not self._initialized and not self._loaded_shadow:
             return {
                 "global_step": self.global_step,
                 "local_step": self.local_step,
@@ -562,20 +568,10 @@ class EMA:
                 buf.copy_(live_buffers[name].data)
 
 
-class _StateDict(OrderedDict[str, Tensor]):
-    """The mapping ``nn.Module.state_dict`` actually returns.
-
-    torch attaches ``_metadata`` to it and reads it back in ``load_state_dict``
-    for module-version migration hooks. No stub declares the attribute, so a
-    plain ``OrderedDict`` cannot carry it across a clone.
-    """
-
-    _metadata: OrderedDict[str, dict[str, object]]
-
-
-def _clone_module_state(source: Mapping[str, Tensor]) -> _StateDict:
+def _clone_module_state(source: Mapping[str, Tensor]) -> OrderedDict[str, Tensor]:
     """Clone a module ``state_dict`` for storage independence, keeping ``_metadata``."""
-    cloned = _StateDict((name, v.detach().clone()) for name, v in source.items())
+    # A custom dictionary subclass cannot be loaded by torch's weights-only loader.
+    cloned = OrderedDict((name, v.detach().clone()) for name, v in source.items())
     metadata = getattr(source, "_metadata", None)
     if metadata is not None:
         metadata_name = "_" + "metadata"

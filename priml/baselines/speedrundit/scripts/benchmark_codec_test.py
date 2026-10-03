@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from functools import partial
 from typing import TYPE_CHECKING
 
 import math
@@ -9,12 +10,16 @@ import math
 import pytest
 import torch
 
+from priml.baselines.speedrundit.corpus import CorpusMismatchError
 from priml.baselines.speedrundit.latent_codec import FloatCodec, ScalarTableCodec
-from priml.baselines.speedrundit.scripts import benchmark_codec
+from priml.baselines.speedrundit.scripts import benchmark_codec, prepare_data
+from priml.baselines.speedrundit.scripts.prepare_data_test import _imagenet, _source
 from priml.model.vision_ae.latent_norm import ScaleLatents
 
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from torch import Tensor
 
 
@@ -92,6 +97,74 @@ def test_fit_stability_reports_each_size() -> None:
     )
     assert set(curve) == {16, 64}
     assert all(value > 0 for value in curve.values())
+
+
+def test_unequal_fit_and_eval_requests_get_the_requested_counts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _source(tmp_path)
+    monkeypatch.setattr(benchmark_codec, "dataset_config", partial(_config, config))
+    monkeypatch.setattr(benchmark_codec, "candidates", dict)
+    report = benchmark_codec.run(
+        "test",
+        _imagenet(tmp_path, 8),
+        num_fit_images=6,
+        num_eval_images=2,
+        device="cpu",
+        batch_size=2,
+        decode_images=False,
+    )
+    assert (report["fit_images"], report["eval_images"]) == (6, 2)
+
+
+def _config(config: object, experiment: str) -> object:
+    del experiment
+    return config
+
+
+def test_benchmark_refuses_crops_from_another_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = _imagenet(tmp_path / "first", 2)
+    second = _imagenet(tmp_path / "second", 2)
+    config = _source(tmp_path)
+    prepare_data.prepare(config, first, device="cpu")
+    monkeypatch.setattr(benchmark_codec, "dataset_config", partial(_config, config))
+    monkeypatch.setattr(benchmark_codec, "candidates", dict)
+    with pytest.raises(CorpusMismatchError, match="image source"):
+        benchmark_codec.run(
+            "test",
+            second,
+            num_fit_images=1,
+            num_eval_images=1,
+            device="cpu",
+            batch_size=2,
+            decode_images=False,
+        )
+
+
+def test_preparation_refuses_crops_from_another_benchmarks_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = _imagenet(tmp_path / "first", 2)
+    second = _imagenet(tmp_path / "second", 2)
+    config = _source(tmp_path)
+    monkeypatch.setattr(benchmark_codec, "dataset_config", partial(_config, config))
+    monkeypatch.setattr(benchmark_codec, "candidates", dict)
+    benchmark_codec.run(
+        "test",
+        first,
+        num_fit_images=1,
+        num_eval_images=1,
+        device="cpu",
+        batch_size=2,
+        decode_images=False,
+    )
+    with pytest.raises(CorpusMismatchError, match="image source"):
+        prepare_data.prepare(config, second, device="cpu")
 
 
 def test_every_candidate_builds() -> None:

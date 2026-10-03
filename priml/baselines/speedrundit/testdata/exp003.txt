@@ -77,7 +77,7 @@ SpeedrunTrainLoop(
                 │               update_after_step=0,
                 │               update_every=1,
                 │               track_buffers=False,
-                │               shadow_kind='module',
+                │               shadow_kind='param_dict',
                 │               warmup_seed=False,
                 │               decay_schedule=<function priml.train.ema.constant_decay at 0xdefacedeface>,
                 │               select=<function priml.optimizers.parameter_filter.trainable at 0xdefacedeface>

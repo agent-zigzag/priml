@@ -56,6 +56,25 @@ def test_scale_refuses_zero() -> None:
         _ = ScaleLatents.Config(scale=0.0).make()
 
 
+@pytest.mark.parametrize("scale", [float("nan"), float("inf"), -float("inf")])
+def test_scale_refuses_nonfinite_multipliers(scale: float) -> None:
+    with pytest.raises(ValueError, match="finite"):
+        ScaleLatents.Config(scale=scale).make()
+
+
+@pytest.mark.parametrize("multiplier", [0.0, float("nan"), float("inf"), -float("inf")])
+def test_channel_stats_require_invertible_multiplier(
+    tmp_path: Path,
+    multiplier: float,
+) -> None:
+    config = ChannelLatentStats.Config(
+        stats=_stats_file(tmp_path, mean=torch.zeros(1), std=torch.ones(1)),
+        multiplier=multiplier,
+    )
+    with pytest.raises(ValueError, match="finite nonzero"):
+        config.make()
+
+
 def test_elementwise_stats_follow_rae_order(tmp_path: Path) -> None:
     """``(z - mean) / sqrt(var + eps)`` and ``z * sqrt(var + eps) + mean``."""
     mean = torch.rand(3, 4, 4, generator=torch.Generator().manual_seed(1))

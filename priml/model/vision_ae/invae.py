@@ -19,13 +19,12 @@ References:
 """
 
 # Preserve the published checkpoint's module names and third-party signatures.
-# pyright: basic
-# ruff: noqa: ANN001, ANN003, ANN201, D101, D103, N802, ARG002, RUF005, B007, RET504, F841
+# ruff: noqa: D101, D103, N802, ARG002, RUF005, RET504
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Final, Self, cast, override
+from typing import Final, Protocol, Self, TypedDict, cast, override
 
 import math
 
@@ -44,18 +43,19 @@ from priml.model.vision_ae.custom_types import (
     CheckpointFile,
     LatentFn,
     LatentNormalizer,
+    posterior_mode,
     posterior_sample,
     require_uint8,
 )
 from priml.model.vision_ae.latent_norm import ScaleLatents
 
 
-def nonlinearity(x):
+def nonlinearity(x: Tensor) -> Tensor:
     # Swish.
     return x * torch.sigmoid(x)
 
 
-def Normalize(in_channels, num_groups=32):
+def Normalize(in_channels: int, num_groups: int = 32) -> nn.GroupNorm:
     return torch.nn.GroupNorm(
         num_groups=num_groups,
         num_channels=in_channels,
@@ -65,7 +65,7 @@ def Normalize(in_channels, num_groups=32):
 
 
 class Upsample(nn.Module):
-    def __init__(self, in_channels, with_conv):
+    def __init__(self, in_channels: int, with_conv: bool) -> None:
         super().__init__()
         self.with_conv = with_conv
         if self.with_conv:
@@ -78,7 +78,7 @@ class Upsample(nn.Module):
             )
 
     @override
-    def forward(self, x):
+    def forward(self, x: Tensor) -> Tensor:
         x = torch.nn.functional.interpolate(x, scale_factor=2.0, mode="nearest")
         if self.with_conv:
             x = self.conv(x)
@@ -86,7 +86,7 @@ class Upsample(nn.Module):
 
 
 class Downsample(nn.Module):
-    def __init__(self, in_channels, with_conv):
+    def __init__(self, in_channels: int, with_conv: bool) -> None:
         super().__init__()
         self.with_conv = with_conv
         if self.with_conv:
@@ -100,7 +100,7 @@ class Downsample(nn.Module):
             )
 
     @override
-    def forward(self, x):
+    def forward(self, x: Tensor) -> Tensor:
         if self.with_conv:
             pad = (0, 1, 0, 1)
             x = torch.nn.functional.pad(x, pad, mode="constant", value=0)
@@ -114,13 +114,13 @@ class ResnetBlock(nn.Module):
     def __init__(
         self,
         *,
-        in_channels,
-        out_channels=None,
-        conv_shortcut=False,
-        dropout,
-        temb_channels=512,
-        num_groups=32,
-    ):
+        in_channels: int,
+        out_channels: int | None = None,
+        conv_shortcut: bool = False,
+        dropout: float,
+        temb_channels: int = 512,
+        num_groups: int = 32,
+    ) -> None:
         super().__init__()
         self.in_channels = in_channels
         out_channels = in_channels if out_channels is None else out_channels
@@ -189,7 +189,7 @@ class ResnetBlock(nn.Module):
 
 
 class AttnBlock(nn.Module):
-    def __init__(self, in_channels, num_groups=32):
+    def __init__(self, in_channels: int, num_groups: int = 32) -> None:
         super().__init__()
         self.in_channels = in_channels
 
@@ -254,24 +254,52 @@ class AttnBlock(nn.Module):
         return x + h_
 
 
+class _Stage(Protocol):
+    """Typed containers retaining the reference's checkpoint hierarchy."""
+
+    block: nn.ModuleList
+    attn: nn.ModuleList
+    downsample: Downsample
+    upsample: Upsample
+
+
+class _Middle(Protocol):
+    """The reference's two residual blocks surrounding one attention block."""
+
+    block_1: ResnetBlock
+    attn_1: AttnBlock
+    block_2: ResnetBlock
+
+
+class _Architecture(TypedDict):
+    """Shared architecture arguments accepted by both reference modules."""
+
+    ch: int
+    ch_mult: tuple[int, ...]
+    num_res_blocks: int
+    resolution: int
+    z_channels: int
+    num_groups: int
+
+
 class Encoder(nn.Module):
     def __init__(
         self,
         *,
-        ch=128,
-        out_ch=3,
-        ch_mult=(1, 1, 2, 2, 4),
-        num_res_blocks=2,
-        attn_resolutions=(16,),
-        dropout=0.0,
-        resamp_with_conv=True,
-        in_channels=3,
-        resolution=256,
-        z_channels=16,
-        double_z=True,
-        num_groups=32,
-        **ignore_kwargs,
-    ):
+        ch: int = 128,
+        out_ch: int = 3,
+        ch_mult: tuple[int, ...] = (1, 1, 2, 2, 4),
+        num_res_blocks: int = 2,
+        attn_resolutions: tuple[int, ...] = (16,),
+        dropout: float = 0.0,
+        resamp_with_conv: bool = True,
+        in_channels: int = 3,
+        resolution: int = 256,
+        z_channels: int = 16,
+        double_z: bool = True,
+        num_groups: int = 32,
+        **ignore_kwargs: object,
+    ) -> None:
         super().__init__()
         self.ch = ch
         self.temb_ch = 0
@@ -298,7 +326,7 @@ class Encoder(nn.Module):
             attn = nn.ModuleList()
             block_in = ch * in_ch_mult[i_level]
             block_out = ch * ch_mult[i_level]
-            for i_block in range(self.num_res_blocks):
+            for _i_block in range(self.num_res_blocks):
                 block.append(
                     ResnetBlock(
                         in_channels=block_in,
@@ -348,7 +376,7 @@ class Encoder(nn.Module):
         )
 
     @override
-    def forward(self, x):
+    def forward(self, x: Tensor) -> Tensor:
         # Assert x.shape[2] == x.shape[3] == self.resolution, "{}, {}, {}".format(x.shape[2], x.shape[3], self.resolution)
 
         # Timestep embedding.
@@ -358,18 +386,24 @@ class Encoder(nn.Module):
         hs = [self.conv_in(x)]
         for i_level in range(self.num_resolutions):
             for i_block in range(self.num_res_blocks):
-                h = self.down[i_level].block[i_block](hs[-1], temb)
-                if len(self.down[i_level].attn) > 0:
-                    h = self.down[i_level].attn[i_block](h)
+                h = cast(
+                    "ResnetBlock",
+                    cast("_Stage", self.down[i_level]).block[i_block],
+                )(hs[-1], temb)
+                if len(cast("_Stage", self.down[i_level]).attn) > 0:
+                    h = cast(
+                        "AttnBlock",
+                        cast("_Stage", self.down[i_level]).attn[i_block],
+                    )(h)
                 hs.append(h)
             if i_level != self.num_resolutions - 1:
-                hs.append(self.down[i_level].downsample(hs[-1]))
+                hs.append(cast("_Stage", self.down[i_level]).downsample(hs[-1]))
 
         # Middle.
         h = hs[-1]
-        h = self.mid.block_1(h, temb)
-        h = self.mid.attn_1(h)
-        h = self.mid.block_2(h, temb)
+        h = cast("_Middle", self.mid).block_1(h, temb)
+        h = cast("_Middle", self.mid).attn_1(h)
+        h = cast("_Middle", self.mid).block_2(h, temb)
 
         # End.
         h = self.norm_out(h)
@@ -382,20 +416,20 @@ class Decoder(nn.Module):
     def __init__(
         self,
         *,
-        ch=128,
-        out_ch=3,
-        ch_mult=(1, 1, 2, 2, 4),
-        num_res_blocks=2,
-        attn_resolutions=(16,),
-        dropout=0.0,
-        resamp_with_conv=True,
-        in_channels=3,
-        resolution=256,
-        z_channels=16,
-        give_pre_end=False,
-        num_groups=32,
-        **ignore_kwargs,
-    ):
+        ch: int = 128,
+        out_ch: int = 3,
+        ch_mult: tuple[int, ...] = (1, 1, 2, 2, 4),
+        num_res_blocks: int = 2,
+        attn_resolutions: tuple[int, ...] = (16,),
+        dropout: float = 0.0,
+        resamp_with_conv: bool = True,
+        in_channels: int = 3,
+        resolution: int = 256,
+        z_channels: int = 16,
+        give_pre_end: bool = False,
+        num_groups: int = 32,
+        **ignore_kwargs: object,
+    ) -> None:
         super().__init__()
         self.ch = ch
         self.temb_ch = 0
@@ -406,7 +440,6 @@ class Decoder(nn.Module):
         self.give_pre_end = give_pre_end
 
         # Compute in_ch_mult, block_in and curr_res at lowest res.
-        in_ch_mult = (1,) + tuple(ch_mult)
         block_in = ch * ch_mult[self.num_resolutions - 1]
         curr_res = resolution // 2 ** (self.num_resolutions - 1)
         self.z_shape = (1, z_channels, curr_res, curr_res)
@@ -450,7 +483,7 @@ class Decoder(nn.Module):
             block = nn.ModuleList()
             attn = nn.ModuleList()
             block_out = ch * ch_mult[i_level]
-            for i_block in range(self.num_res_blocks + 1):
+            for _i_block in range(self.num_res_blocks + 1):
                 block.append(
                     ResnetBlock(
                         in_channels=block_in,
@@ -482,7 +515,7 @@ class Decoder(nn.Module):
         )
 
     @override
-    def forward(self, z):
+    def forward(self, z: Tensor) -> Tensor:
         # Assert z.shape[1:] == self.z_shape[1:].
         self.last_z_shape = z.shape
 
@@ -493,18 +526,24 @@ class Decoder(nn.Module):
         h = self.conv_in(z)
 
         # Middle.
-        h = self.mid.block_1(h, temb)
-        h = self.mid.attn_1(h)
-        h = self.mid.block_2(h, temb)
+        h = cast("_Middle", self.mid).block_1(h, temb)
+        h = cast("_Middle", self.mid).attn_1(h)
+        h = cast("_Middle", self.mid).block_2(h, temb)
 
         # Upsampling.
         for i_level in reversed(range(self.num_resolutions)):
             for i_block in range(self.num_res_blocks + 1):
-                h = self.up[i_level].block[i_block](h, temb)
-                if len(self.up[i_level].attn) > 0:
-                    h = self.up[i_level].attn[i_block](h)
+                h = cast(
+                    "ResnetBlock",
+                    cast("_Stage", self.up[i_level]).block[i_block],
+                )(h, temb)
+                if len(cast("_Stage", self.up[i_level]).attn) > 0:
+                    h = cast(
+                        "AttnBlock",
+                        cast("_Stage", self.up[i_level]).attn[i_block],
+                    )(h)
             if i_level != 0:
-                h = self.up[i_level].upsample(h)
+                h = cast("_Stage", self.up[i_level]).upsample(h)
 
         # End.
         if self.give_pre_end:
@@ -519,7 +558,7 @@ class Decoder(nn.Module):
 class DiagonalGaussianDistribution:
     """The encoder's axis-aligned Gaussian over latents; satisfies ``Posterior``."""
 
-    def __init__(self, parameters):
+    def __init__(self, parameters: Tensor) -> None:
         self.parameters = parameters
         self.mean, self.logvar = torch.chunk(parameters, 2, dim=1)
         self.logvar = torch.clamp(self.logvar, -30.0, 20.0)
@@ -611,8 +650,8 @@ class INVAE(nn.Module):
             """Cost one ``decode(encode(image))`` round trip at ``image_size``.
 
             Counts the uint8 cast and rescale, the encoder, ``quant_conv``, the
-            posterior's clamp and exponentials, one ``mean + std * noise`` draw
-            whatever ``latent_fn`` selects, ``post_quant_conv``, the decoder, and
+            posterior's clamp and exponentials, a ``mean + std * noise`` draw
+            when sampling is selected, ``post_quant_conv``, the decoder, and
             the output shift and clamp. The weights are frozen, so only the
             forward is charged; the parameters are still owned.
 
@@ -626,6 +665,8 @@ class INVAE(nn.Module):
 
             """
             del kwargs
+            if self.latent_fn not in (posterior_sample, posterior_mode):
+                raise ValueError("Cost requires posterior_sample or posterior_mode.")
             # A walk mirroring ``Encoder`` and ``Decoder.__init__`` rather than a
             # hooked meta-device forward: torch runs meta kernels in Python, ~50 ms
             # a call at the published size. The torch comparison in the tests
@@ -689,10 +730,16 @@ class INVAE(nn.Module):
                 # Clamp logvar; ``exp(0.5 * logvar)`` and ``exp(logvar)``.
                 + _pointwise(latents, flops=2, dtype=dtype)
                 + _pointwise(latents, flops=1, dtype=dtype).tile(3)
-                # The noise is charged as the tensor it writes, with no FLOPs.
-                + traffic("primal", "elementwise", elements=latents, dtype=dtype)
-                + _pointwise(latents, flops=1, inputs=2, dtype=dtype).tile(2)
             )
+            if self.latent_fn is posterior_sample:
+                # The noise is charged as the tensor it writes, with no FLOPs.
+                wrapper += traffic(
+                    "primal",
+                    "elementwise",
+                    elements=latents,
+                    dtype=dtype,
+                )
+                wrapper += _pointwise(latents, flops=1, inputs=2, dtype=dtype).tile(2)
             full = encoder + decoder + wrapper
             return Cost(
                 cells=full.only("primal").cells,
@@ -702,7 +749,7 @@ class INVAE(nn.Module):
 
     def __init__(self, config: Config) -> None:
         super().__init__()
-        architecture = {
+        architecture: _Architecture = {
             "ch": config.channels_hidden,
             "ch_mult": config.channel_multipliers,
             "num_res_blocks": config.blocks_per_stage,
@@ -786,7 +833,7 @@ class INVAE(nn.Module):
           image: ``[B, 3, H, W]`` float RGB, clamped.
 
         """
-        decoded = cast("Tensor", self.decoder(self.post_quant_conv(latent)))
+        decoded = self.decoder(self.post_quant_conv(latent))
         return ((decoded + 1) / 2).clamp(0, 1)
 
 

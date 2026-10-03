@@ -113,19 +113,8 @@ class FloatCodec:
         Returns:
           stored: The latent in ``stored_dtype``.
 
-        Raises:
-          ValueError: A value overflows the stored dtype.
-
         """
-        stored = latent.to(self.stored_dtype)
-        # float16 saturates at 65504 to inf; an overflow is a corpus that decodes to
-        # garbage, so it fails here rather than at training time.
-        if not bool(torch.isfinite(stored).all()):
-            raise ValueError(
-                f"Latent does not fit {self.stored_dtype}: a value is non-finite "
-                "or out of range.",
-            )
-        return stored
+        return latent.to(self.stored_dtype)
 
     def decode(self, stored: Tensor, /) -> Tensor:
         """Widen to float32.
@@ -203,7 +192,7 @@ class GaussianFit:
 
         """
         x = values.to(torch.float64)
-        return x.mean() + x.std() * self.unit
+        return x.mean() + x.std() * self.unit.to(x.device)
 
 
 class QuantileFit:
@@ -230,7 +219,9 @@ class QuantileFit:
 
         """
         x = values.to(torch.float64).sort().values
-        position = (torch.arange(NUM_LEVELS, dtype=torch.float64) + 0.5) / NUM_LEVELS
+        position = (
+            torch.arange(NUM_LEVELS, dtype=torch.float64, device=x.device) + 0.5
+        ) / NUM_LEVELS
         index = (position * x.numel()).long().clamp(max=x.numel() - 1)
         return x[index]
 
@@ -266,7 +257,11 @@ class LinearFit:
             spread = self.clip_sigmas * x.std()
             low, high = x.mean() - spread, x.mean() + spread
         step = (high - low) / NUM_LEVELS
-        return low + (torch.arange(NUM_LEVELS, dtype=torch.float64) + 0.5) * step
+        return (
+            low
+            + (torch.arange(NUM_LEVELS, dtype=torch.float64, device=x.device) + 0.5)
+            * step
+        )
 
 
 @runtime_checkable
@@ -289,7 +284,7 @@ class PerChannel:
 
     def __call__(self, scale: Tensor, /) -> Tensor:
         """Return ``arange(C)``."""
-        return torch.arange(scale.numel())
+        return torch.arange(scale.numel(), device=scale.device)
 
 
 class SharedTable:
@@ -303,7 +298,7 @@ class SharedTable:
 
     def __call__(self, scale: Tensor, /) -> Tensor:
         """Return all zeros."""
-        return torch.zeros(scale.numel(), dtype=torch.int64)
+        return torch.zeros(scale.numel(), dtype=torch.int64, device=scale.device)
 
 
 class ScaleGroups:
@@ -330,8 +325,8 @@ class ScaleGroups:
           groups: ``[C]`` int64 in ``[0, num_groups)``.
 
         """
-        rank = torch.empty(scale.numel(), dtype=torch.int64)
-        rank[scale.argsort()] = torch.arange(scale.numel())
+        rank = torch.empty(scale.numel(), dtype=torch.int64, device=scale.device)
+        rank[scale.argsort()] = torch.arange(scale.numel(), device=scale.device)
         return rank * self.num_groups // scale.numel()
 
 
@@ -381,7 +376,12 @@ class ScalarTableCodec:
         channels = sample.shape[1]
         scale = torch.stack([sample[:, c].double().std() for c in range(channels)])
         groups = self.groups(scale)
-        levels = torch.empty(channels, NUM_LEVELS, dtype=torch.float32)
+        levels = torch.empty(
+            channels,
+            NUM_LEVELS,
+            dtype=torch.float32,
+            device=sample.device,
+        )
         for group in groups.unique():
             members = (groups == group).nonzero().flatten()
             values = sample[:, members].reshape(-1)
@@ -405,10 +405,11 @@ class ScalarTableCodec:
         """Restore a fitted table.
 
         Args:
-          table: ``levels`` and ``thresholds`` as :meth:`table` returns them.
+          table: Finite, sorted ``levels`` and their midpoint ``thresholds``,
+            as :meth:`table` returns them. Corpus I/O audits persisted values.
 
         Raises:
-          ValueError: The table is malformed or its levels decrease.
+          ValueError: The table has incompatible shapes.
 
         """
         levels = table["levels"].float()
@@ -419,8 +420,6 @@ class ScalarTableCodec:
             )
         if thresholds.shape != (levels.shape[0], NUM_LEVELS - 1):
             raise ValueError("thresholds must be [C, 255], one row per level row.")
-        if not bool((levels[:, 1:] >= levels[:, :-1]).all()):
-            raise ValueError("levels must be non-decreasing in every row.")
         self.levels = levels
         self.thresholds = thresholds
 
@@ -465,6 +464,7 @@ class ScalarTableCodec:
 
         """
         levels, _ = self._fitted()
+        levels = levels.to(latent.device)
         shape = (-1,) + (1,) * 2
         low = levels[:, 0].view(shape)
         high = levels[:, -1].view(shape)
