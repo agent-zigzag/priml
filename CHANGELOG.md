@@ -49,6 +49,12 @@ All notable priml changes are documented here. This project follows
   `prepare_data.py --receipt-only`. `prepare_data.py` takes `--experiment`
   in place of `--output`, `--checkpoint`, and `--resolution`.
 
+### Fixed
+
+- Cropped JPEG decodes find libturbojpeg where `TurboJPEG()` does. The
+  region decoder only asked `find_library`, which misses a Homebrew install
+  on Apple Silicon, so every crop there decoded to `None`.
+
 ## 0.1.4 - 2026-08-19
 
 ### Changed
